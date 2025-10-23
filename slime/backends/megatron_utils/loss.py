@@ -524,8 +524,9 @@ def policy_loss_function(
             debug_output["metrics"]["kl_loss"] = kl_loss.detach().cpu()
         
         if args.use_tis:
-            debug_output["tis"] = [t.detach().cpu() for t in torch.split(tis, [r for r in response_lengths])]
-            debug_output["ois"] = [o.detach().cpu() for o in torch.split(ois, [r for r in response_lengths])]
+            # Save concatenated tensors for TIS (split may not work correctly with CP/GSPO)
+            debug_output["tis_concat"] = tis.detach().cpu()
+            debug_output["ois_concat"] = ois.detach().cpu()
             debug_output["metrics"]["tis"] = sum_of_sample_mean(tis).detach().cpu()
             debug_output["metrics"]["ois"] = sum_of_sample_mean(ois).detach().cpu()
             debug_output["metrics"]["tis_clipfrac"] = sum_of_sample_mean(tis_clipfrac).detach().cpu()

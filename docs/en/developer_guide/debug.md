@@ -81,8 +81,8 @@ Specifically, slime currently provides the following parameters for separate deb
                     "tis_clipfrac": torch.Tensor,          # TIS clipping fraction (if args.use_tis)
                 },
                 # Optional TIS fields (if args.use_tis):
-                "tis": list[torch.Tensor],                 # Per-token TIS weights
-                "ois": list[torch.Tensor],                 # Per-token OIS weights
+                "tis_concat": torch.Tensor,                # Concatenated TIS weights (all tokens)
+                "ois_concat": torch.Tensor,                # Concatenated OIS weights (all tokens)
             },
             # ... more batches
         ]

@@ -79,8 +79,8 @@ slime 支持将训练部分和推理部分分开进行调试，从而实现：
                    "tis_clipfrac": torch.Tensor,          # TIS 裁剪比例（如果 args.use_tis）
                },
                # 可选的 TIS 字段（如果 args.use_tis）:
-               "tis": list[torch.Tensor],                 # 逐token TIS 权重
-               "ois": list[torch.Tensor],                 # 逐token OIS 权重
+               "tis_concat": torch.Tensor,                # 拼接的 TIS 权重（所有token）
+               "ois_concat": torch.Tensor,                # 拼接的 OIS 权重（所有token）
            },
            # ... 更多批次
        ]
