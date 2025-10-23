@@ -49,3 +49,44 @@ Specifically, slime currently provides the following parameters for separate deb
 4.  `--load-debug-rollout-data /your/saved/debug/data_{rollout_id}.pt`
 
     When enabled, data will be loaded from `args.load_debug_rollout_data.format(rollout_id=rollout_id)`, and SGLang will not be initialized (automatically setting `debug_train_only=True`). This method allows you to fix the input for the training part to tune it, for example, by switching between different parallelization strategies.
+
+5.  `--save-debug-train-output /your/saved/debug/output_{rollout_id}.pt`
+
+    When enabled, per-batch model outputs during training will be saved for comprehensive debugging. The file is saved using the format: `args.save_debug_train_output.format(rollout_id=rollout_id, rank=rank)`.
+    
+    **Saved data format**: The saved file contains a dictionary with the following structure:
+    ```python
+    {
+        "rollout_id": int,           # Rollout identifier
+        "rank": int,                 # GPU rank
+        "outputs": [                 # List of per-batch outputs
+            {
+                "tokens": list[torch.Tensor],              # Token IDs for each sample
+                "old_log_probs": list[torch.Tensor],       # Old policy log probabilities (per-token)
+                "curr_log_probs": list[torch.Tensor],      # Current policy log probabilities (per-token)
+                "importance": list[torch.Tensor],          # Per-token importance = exp(curr - old)
+                "entropy": list[torch.Tensor],             # Per-token entropy
+                "advantages": list[torch.Tensor],          # Per-token advantages
+                "response_lengths": list[int],             # Response length for each sample
+                "total_lengths": list[int],                # Total length for each sample
+                "metrics": {                               # Aggregated metrics
+                    "pg_loss": torch.Tensor,               # Policy gradient loss
+                    "entropy_loss": torch.Tensor,          # Entropy loss
+                    "pg_clipfrac": torch.Tensor,           # PPO clipping fraction
+                    "ppo_kl": torch.Tensor,                # PPO KL divergence
+                    # Optional fields (if enabled):
+                    "kl_loss": torch.Tensor,               # KL loss (if args.use_kl_loss)
+                    "tis": torch.Tensor,                   # TIS weight (if args.use_tis)
+                    "ois": torch.Tensor,                   # OIS weight (if args.use_tis)
+                    "tis_clipfrac": torch.Tensor,          # TIS clipping fraction (if args.use_tis)
+                },
+                # Optional TIS fields (if args.use_tis):
+                "tis": list[torch.Tensor],                 # Per-token TIS weights
+                "ois": list[torch.Tensor],                 # Per-token OIS weights
+            },
+            # ... more batches
+        ]
+    }
+    ```
+    
+    This comprehensive output allows for detailed analysis of the training process, including tracking per-token importance weights (which represent the ratio between current and old policies), and all loss components.

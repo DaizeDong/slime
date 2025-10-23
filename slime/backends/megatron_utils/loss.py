@@ -20,6 +20,27 @@ from slime.utils.types import RolloutBatch
 
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
+# Global storage for debug train outputs
+_debug_train_outputs = []
+
+
+def clear_debug_train_outputs() -> None:
+    """Clear the global debug train outputs storage."""
+    global _debug_train_outputs
+    _debug_train_outputs = []
+
+
+def get_debug_train_outputs() -> list:
+    """Get the current debug train outputs."""
+    global _debug_train_outputs
+    return _debug_train_outputs
+
+
+def add_debug_train_output(output: dict) -> None:
+    """Add a debug train output to the global storage."""
+    global _debug_train_outputs
+    _debug_train_outputs.append(output)
+
 
 def get_responses(
     logits: torch.Tensor,
@@ -473,6 +494,43 @@ def policy_loss_function(
         reported_loss["tis"] = sum_of_sample_mean(tis).clone().detach()
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
         reported_loss["tis_clipfrac"] = sum_of_sample_mean(tis_clipfrac).clone().detach()
+
+    # Store detailed per-batch outputs for debug if requested
+    if getattr(args, "save_debug_train_output", None) is not None and mpu.is_pipeline_last_stage():
+        # Store per-sample data (before aggregation)
+        debug_output = {
+            "tokens": [t.detach().cpu() for t in batch["unconcat_tokens"]],
+            "old_log_probs": [lp.detach().cpu() for lp in batch["log_probs"]],
+            "curr_log_probs": [lp.detach().cpu() for lp in log_probs_and_entropy["log_probs"]],
+            "importance": [
+                torch.exp(curr - old).detach().cpu()
+                for curr, old in zip(log_probs_and_entropy["log_probs"], batch["log_probs"])
+            ],
+            "entropy": [e.detach().cpu() for e in log_probs_and_entropy["entropy"]],
+            "advantages": [a.detach().cpu() for a in batch["advantages"]],
+            "response_lengths": response_lengths,
+            "total_lengths": total_lengths,
+        }
+        
+        # Add aggregated loss metrics
+        debug_output["metrics"] = {
+            "pg_loss": pg_loss.detach().cpu(),
+            "entropy_loss": entropy_loss.detach().cpu(),
+            "pg_clipfrac": pg_clipfrac.detach().cpu(),
+            "ppo_kl": ppo_kl.detach().cpu(),
+        }
+        
+        if args.use_kl_loss:
+            debug_output["metrics"]["kl_loss"] = kl_loss.detach().cpu()
+        
+        if args.use_tis:
+            debug_output["tis"] = [t.detach().cpu() for t in torch.split(tis, [r for r in response_lengths])]
+            debug_output["ois"] = [o.detach().cpu() for o in torch.split(ois, [r for r in response_lengths])]
+            debug_output["metrics"]["tis"] = sum_of_sample_mean(tis).detach().cpu()
+            debug_output["metrics"]["ois"] = sum_of_sample_mean(ois).detach().cpu()
+            debug_output["metrics"]["tis_clipfrac"] = sum_of_sample_mean(tis_clipfrac).detach().cpu()
+        
+        add_debug_train_output(debug_output)
 
     return loss, reported_loss
 

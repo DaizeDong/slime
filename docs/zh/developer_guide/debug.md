@@ -47,3 +47,44 @@ slime 支持将训练部分和推理部分分开进行调试，从而实现：
 3. `--load-debug-rollout-data /your/saved/debug/data_{rollout_id}.pt`
 
    开启后，会从 `args.load_debug_rollout_data.format(rollout_id=rollout_id)` 来加载数据，并且不会初始化 sglang（自动设置 `debug_train_only=True`）。可以以这种方式来固定训练部分的输入，对训练部分进行调优，例如切换各种并行。
+
+4. `--save-debug-train-output /your/saved/debug/output_{rollout_id}.pt`
+
+   开启后，会保存训练过程中每个批次的详细模型输出，用于全面的调试分析。文件保存格式为：`args.save_debug_train_output.format(rollout_id=rollout_id, rank=rank)`。
+   
+   **保存数据格式**: 保存的文件包含如下结构的字典：
+   ```python
+   {
+       "rollout_id": int,           # Rollout 标识符
+       "rank": int,                 # GPU rank
+       "outputs": [                 # 每个批次的输出列表
+           {
+               "tokens": list[torch.Tensor],              # 每个样本的 token ID
+               "old_log_probs": list[torch.Tensor],       # 旧策略的对数概率（逐token）
+               "curr_log_probs": list[torch.Tensor],      # 当前策略的对数概率（逐token）
+               "importance": list[torch.Tensor],          # 逐token重要性 = exp(curr - old)
+               "entropy": list[torch.Tensor],             # 逐token熵
+               "advantages": list[torch.Tensor],          # 逐token优势
+               "response_lengths": list[int],             # 每个样本的响应长度
+               "total_lengths": list[int],                # 每个样本的总长度
+               "metrics": {                               # 聚合指标
+                   "pg_loss": torch.Tensor,               # 策略梯度损失
+                   "entropy_loss": torch.Tensor,          # 熵损失
+                   "pg_clipfrac": torch.Tensor,           # PPO 裁剪比例
+                   "ppo_kl": torch.Tensor,                # PPO KL 散度
+                   # 可选字段（如果启用）:
+                   "kl_loss": torch.Tensor,               # KL 损失（如果 args.use_kl_loss）
+                   "tis": torch.Tensor,                   # TIS 权重（如果 args.use_tis）
+                   "ois": torch.Tensor,                   # OIS 权重（如果 args.use_tis）
+                   "tis_clipfrac": torch.Tensor,          # TIS 裁剪比例（如果 args.use_tis）
+               },
+               # 可选的 TIS 字段（如果 args.use_tis）:
+               "tis": list[torch.Tensor],                 # 逐token TIS 权重
+               "ois": list[torch.Tensor],                 # 逐token OIS 权重
+           },
+           # ... 更多批次
+       ]
+   }
+   ```
+   
+   这个全面的输出允许对训练过程进行详细分析，包括跟踪逐token的重要性权重（表示当前策略和旧策略之间的比率）以及所有损失组件。

@@ -5,6 +5,7 @@ import os
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from functools import partial
+from pathlib import Path
 
 import torch
 import wandb
@@ -25,7 +26,7 @@ from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
-from .loss import loss_function
+from .loss import clear_debug_train_outputs, get_debug_train_outputs, loss_function
 from .model_provider import get_model_provider_func
 
 
@@ -615,6 +616,46 @@ def train(
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
         disable_forward_pre_hook(model)
+
+
+def save_debug_train_outputs(rollout_id: int, args: Namespace) -> None:
+    """Save debug train outputs to disk.
+    
+    Args:
+        rollout_id: Current rollout identifier.
+        args: Runtime arguments containing save_debug_train_output path template.
+    """
+    if args.save_debug_train_output is None or not mpu.is_pipeline_last_stage():
+        return
+    
+    debug_outputs = get_debug_train_outputs()
+    if not debug_outputs:
+        return
+    
+    rank = torch.distributed.get_rank()
+    path = Path(args.save_debug_train_output.format(rollout_id=rollout_id, rank=rank))
+    
+    # Check if file exists and warn about overwrite
+    if path.exists():
+        print(f"[warn] Overwriting existing debug train output at {path}")
+    
+    # Create parent directory if needed
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Save the outputs
+    torch.save(
+        {
+            "rollout_id": rollout_id,
+            "rank": rank,
+            "outputs": debug_outputs,
+        },
+        path,
+    )
+    print(f"Saved debug train output to {path}")
+    
+    # Clear the global storage
+    clear_debug_train_outputs()
+
 
 
 def save(

@@ -837,6 +837,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--save-debug-train-output",
+                type=str,
+                default=None,
+                help=(
+                    "Save per-batch model outputs during training for debugging. "
+                    "The file will be saved to `save_debug_train_output.format(rollout_id=rollout_id)`. "
+                    "This saves comprehensive data including tokens, log_probs (old and current), "
+                    "per-token importance, and loss components (pg_loss, entropy, kl, clipfrac, etc.)."
+                ),
+            )
+            parser.add_argument(
                 "--dump-details",
                 type=str,
                 default=None,
@@ -1151,6 +1162,7 @@ def slime_validate_args(args):
     if args.dump_details is not None:
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
         args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
+        args.save_debug_train_output = f"{args.dump_details}/train_output/{{rollout_id}}_{{rank}}.pt"
 
     if args.load_debug_rollout_data is not None:
         print(

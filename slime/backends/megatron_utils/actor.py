@@ -28,7 +28,7 @@ from .cp_utils import slice_log_prob_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
-from .model import forward_only, initialize_model_and_optimizer, save, train
+from .model import forward_only, initialize_model_and_optimizer, save, save_debug_train_outputs, train
 from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor, named_parameters
 
 
@@ -358,6 +358,9 @@ class MegatronTrainRayActor(TrainRayActor):
             ):
                 self.prof.stop()
                 self.prof = None
+
+        # Save debug train outputs if requested
+        save_debug_train_outputs(rollout_id, self.args)
 
         # TODO extract to a function during refactor
         if (path_template := self.args.save_debug_train_data) is not None:
