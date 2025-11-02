@@ -10,3 +10,4 @@ tensorboard
 transformers
 wandb
 huggingface_hub
+weave

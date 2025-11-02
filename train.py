@@ -1,4 +1,5 @@
 import ray
+import weave
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 try:
