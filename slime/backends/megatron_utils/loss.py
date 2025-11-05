@@ -2,6 +2,7 @@ from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any, Dict, Tuple, Union
 
+import math
 import torch
 from megatron.core import mpu
 
@@ -19,6 +20,10 @@ from slime.utils.ppo_utils import (
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
+
+# Global buffer to store debug data across microbatches
+# This prevents OOM by avoiding accumulation in Megatron's logging_dict
+_DEBUG_DATA_BUFFER = []
 
 
 def get_responses(
@@ -54,6 +59,12 @@ def get_responses(
     assert logits.dtype == torch.float32, f"{logits.dtype}"
 
     logits = logits.squeeze(0)
+
+    temp = float(args.rollout_temperature) if hasattr(args, "rollout_temperature") else 1.0
+    if not math.isfinite(temp) or temp <= 0.0:
+        raise ValueError(f"Invalid rollout_temperature: {temp}")
+    logits = logits / temp
+
     logits = logits.div(args.rollout_temperature)
 
     cp_size = mpu.get_context_parallel_world_size()
@@ -643,7 +654,9 @@ def loss_function(
         - `normalizer` is `num_tokens` (scalar tensor) if
           `args.calculate_per_token_loss` is True, else `1` (int).
         - `logging_dict` has keys "keys" (list of str metric names) and
-          "values" (1D tensor: [count, metric1, metric2, ...]).
+          "values" (1D tensor: [count, metric1, metric2, ...]), and optionally
+          "debug_data" (dict) containing detailed per-token information when
+          `args.save_debug_train_output` is set.
     """
     num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
     num_samples = len(batch["response_lengths"])
@@ -680,17 +693,186 @@ def loss_function(
         loss * num_microbatches / args.global_batch_size * mpu.get_data_parallel_world_size(with_context_parallel=True)
     )
 
+    logging_dict = {
+        "keys": list(log.keys()),
+        "values": torch.tensor(
+            [
+                num_samples if not args.calculate_per_token_loss else num_tokens,
+            ]
+            + list(log.values()),
+            device=logits.device,
+        ),
+    }
+
+    # Collect detailed debug data if requested
+    # IMPORTANT: Do NOT put debug_data in logging_dict!
+    # Megatron's pipeline will accumulate all microbatches' logging_dict in GPU memory,
+    # causing OOM. Instead, we store it in a global list and retrieve it later.
+    if args.save_debug_train_output is not None:
+        debug_data = _collect_debug_data(args, batch, logits, log)
+        # Store in global buffer (will be retrieved in train_one_step)
+        global _DEBUG_DATA_BUFFER
+        _DEBUG_DATA_BUFFER.append(debug_data)
+
     return (
         loss,
         num_tokens if args.calculate_per_token_loss else 1,
-        {
-            "keys": list(log.keys()),
-            "values": torch.tensor(
-                [
-                    num_samples if not args.calculate_per_token_loss else num_tokens,
-                ]
-                + list(log.values()),
-                device=logits.device,
-            ),
-        },
+        logging_dict,
     )
+
+
+@torch.no_grad()
+def _collect_debug_data(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    log: dict[str, torch.Tensor],
+) -> dict[str, Any]:
+    """Collect detailed debug data for training output.
+
+    Note on Tensor Parallelism (TP):
+        All log_probs and entropy values computed here are already synchronized across
+        TP ranks via all_reduce operations inside `calculate_log_probs_and_entropy`.
+        The `mpu.get_tensor_model_parallel_group()` is passed to ensure proper
+        synchronization. Therefore, saving only on TP rank 0 is safe - all TP ranks
+        will have identical values.
+
+    Args:
+        args: Configuration.
+        batch: Mini-batch containing training data.
+        logits: Model outputs.
+        log: Metrics computed by the loss function.
+
+    Returns:
+        Dict containing detailed per-token information including:
+        - unconcat_tokens: List of token tensors per sample
+        - response_lengths: Response lengths per sample
+        - total_lengths: Total lengths per sample
+        - loss_masks: Loss masks per sample
+        - advantages: Advantages per sample (if available)
+        - returns: Returns per sample (if available)
+        - old_log_probs: Old log probabilities per sample (if available)
+        - ref_log_probs: Reference log probabilities per sample (if available)
+        - values: Values per sample (if available)
+        - current_log_probs: Current log probabilities computed from logits (TP synchronized)
+        - current_entropy: Entropy computed from logits (TP synchronized, if available)
+        - logits_sample: Sampled logits for inspection
+    """
+    print("Collecting debug data for training output...")
+    debug_data = {}
+
+    # Store batch information
+    debug_data["response_lengths"] = batch.get("response_lengths")
+    debug_data["total_lengths"] = batch.get("total_lengths")
+
+    # Store tokens (only on last pipeline stage to avoid large data transfer)
+    # Use non_blocking=True to immediately free GPU memory while copying to CPU asynchronously
+    # Use detach() for safety, even if these shouldn't have gradients
+    if mpu.is_pipeline_last_stage():
+        debug_data["unconcat_tokens"] = [t.detach().to("cpu", non_blocking=True) if torch.is_tensor(t) else t for t in batch.get("unconcat_tokens", [])]
+        debug_data["loss_masks"] = [m.detach().to("cpu", non_blocking=True) if torch.is_tensor(m) else m for m in batch.get("loss_masks", [])]
+
+        # Store advantages and returns if available
+        if "advantages" in batch:
+            debug_data["advantages"] = [a.detach().to("cpu", non_blocking=True) for a in batch["advantages"]]
+        if "returns" in batch:
+            debug_data["returns"] = [r.detach().to("cpu", non_blocking=True) for r in batch["returns"]]
+
+        # Store old log probs and ref log probs if available
+        if "log_probs" in batch and batch["log_probs"] is not None:
+            debug_data["old_log_probs"] = [lp.detach().to("cpu", non_blocking=True) for lp in batch["log_probs"]]
+        if "ref_log_probs" in batch and batch["ref_log_probs"] is not None:
+            debug_data["ref_log_probs"] = [rlp.detach().to("cpu", non_blocking=True) for rlp in batch["ref_log_probs"]]
+        if "values" in batch and batch["values"] is not None:
+            debug_data["values"] = [v.detach().to("cpu", non_blocking=True) for v in batch["values"]]
+
+        # Compute current log probs and entropy from logits
+        if args.loss_type == "policy_loss":
+            print(f"Computing current log probs and entropy for debug data...")
+            log_probs_and_entropy = get_log_probs_and_entropy(
+                logits,
+                args=args,
+                unconcat_tokens=batch["unconcat_tokens"],
+                total_lengths=batch["total_lengths"],
+                response_lengths=batch["response_lengths"],
+                with_entropy=True,
+            )
+            # CRITICAL: detach() to break gradient graph before transferring to CPU
+            # This prevents the entire forward pass computation graph from being kept in GPU memory
+            debug_data["current_log_probs"] = [lp.detach().to("cpu", non_blocking=True) for lp in log_probs_and_entropy["log_probs"]]
+            debug_data["current_entropy"] = [e.detach().to("cpu", non_blocking=True) for e in log_probs_and_entropy["entropy"]]
+            print(f"current_log_probs (first): {debug_data['current_log_probs'][0][0]}")
+            print(f"current_entropy (first): {debug_data['current_entropy'][0][0]}")
+
+            # Compute PPO/GRPO importance ratio: π_θ / π_old = exp(log π_θ - log π_old)
+            # This is the per-token importance weight used in policy gradient
+            if "log_probs" in batch and batch["log_probs"] is not None:
+                print(f"Computing current importance ratio for debug data...")
+                importance_ratios = []
+                for current_lp, old_lp in zip(log_probs_and_entropy["log_probs"], batch["log_probs"]):
+                    ratio = torch.exp(current_lp - old_lp)
+                    importance_ratios.append(ratio.detach().to("cpu", non_blocking=True))
+                debug_data["policy_importance_ratio"] = importance_ratios
+                print(f"policy_importance_ratio (first): {debug_data['policy_importance_ratio'][0][0]}")
+            else:
+                print(f"Old log probs not found in batch; skipping importance ratio computation.")
+
+            # Compute importance weights if TIS is enabled
+            # Note: TIS weights are different - they're for trajectory importance sampling (π_old / π_rollout)
+            if args.use_tis and "rollout_log_probs" in batch:
+                print(f"Computing TIS importance weights for debug data...")
+                old_log_probs = torch.cat(batch["log_probs"], dim=0)
+                rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
+                tis = torch.exp(old_log_probs - rollout_log_probs)
+                tis_weights = torch.clamp(tis, min=args.tis_clip_low, max=args.tis_clip)
+                # Split back into per-sample list and immediately transfer to CPU
+                split_sizes = [lp.size(0) for lp in batch["log_probs"]]
+                debug_data["tis_importance_weights"] = [w.detach().to("cpu", non_blocking=True) for w in torch.split(tis_weights, split_sizes)]
+                debug_data["tis_importance_weights_unclipped"] = [w.detach().to("cpu", non_blocking=True) for w in torch.split(tis, split_sizes)]
+                print(f"tis_importance_weights (first): {debug_data['tis_importance_weights'][0][0]}")
+                print(f"tis_importance_weights_unclipped (first): {debug_data['tis_importance_weights_unclipped'][0][0]}")
+            else:
+                print(f"TIS not enabled or rollout_log_probs not found; skipping TIS importance weights computation.")
+
+        elif args.loss_type == "value_loss":
+            print(f"Computing current values for debug data...")
+            values_result = get_values(
+                logits,
+                args=args,
+                unconcat_tokens=batch["unconcat_tokens"],
+                total_lengths=batch["total_lengths"],
+                response_lengths=batch["response_lengths"],
+            )
+            debug_data["current_values"] = [v.detach().to("cpu", non_blocking=True) for v in values_result["values"]]
+            print(f"current_values (first): {debug_data['current_values'][0][0]}")
+
+        # Sample a few logits for inspection (to avoid storing huge tensors)
+        # Store logits for first few tokens of first sample
+        # CRITICAL: detach() to prevent keeping the entire model output in memory
+        if logits.size(0) == 1:  # [1, T, V]
+            sample_len = min(10, logits.size(1))
+            debug_data["logits_sample"] = logits[0, :sample_len, :].detach().to("cpu", non_blocking=True)
+
+        # NOTE: MoE routing data is NOT collected here per microbatch!
+        # Routing data accumulates across all microbatches in the step.
+        # Collecting it per microbatch causes massive duplication (microbatch N contains all previous routing).
+        # Instead, routing data is collected ONCE in train_one_step after all microbatches complete.
+        # See train_one_step in model.py for routing data collection.
+
+    return debug_data
+
+
+def get_debug_data_buffer() -> list[dict[str, Any]]:
+    """Get the accumulated debug data from all microbatches.
+
+    Returns:
+        List of debug data dictionaries from all microbatches.
+    """
+    global _DEBUG_DATA_BUFFER
+    return _DEBUG_DATA_BUFFER
+
+
+def clear_debug_data_buffer() -> None:
+    """Clear the debug data buffer to free memory."""
+    global _DEBUG_DATA_BUFFER
+    _DEBUG_DATA_BUFFER.clear()

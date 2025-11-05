@@ -764,6 +764,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
             )
+            parser.add_argument(
+                "--reverse-routing-replay-order",
+                action="store_true",
+                default=False,
+                help=(
+                    "When enabled with --use-routing-replay, reverses the replay order: "
+                    "1) Record routing with current actor (π_θ), "
+                    "2) Compute old_log_probs with old_actor using recorded routing, "
+                    "3) Train with recorded routing. "
+                    "Default behavior: record with old_actor, then train with recorded routing."
+                ),
+            )
+            parser.add_argument(
+                "--routing-replay-union",
+                action="store_true",
+                default=False,
+                help=(
+                    "During replay, combine the recorded routing decisions with the current router's "
+                    "top-k candidates before selecting the final experts."
+                ),
+            )
             return parser
 
         def add_router_arguments(parser):
@@ -907,6 +928,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Save the train data to this path for debugging. "
                     "The file will be saved to `save_debug_train_data.format(rollout_id)`."
+                ),
+            )
+            parser.add_argument(
+                "--save-debug-train-output",
+                type=str,
+                default=None,
+                help=(
+                    "Save the train output to this path for debugging. "
+                    "The file will be saved to `save_debug_train_output.format(rollout_id, rank)`. "
+                    "This includes model outputs, log_probs, loss, advantages, importance weights, etc."
                 ),
             )
             parser.add_argument(

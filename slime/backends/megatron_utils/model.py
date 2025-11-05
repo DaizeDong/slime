@@ -2,9 +2,12 @@ import dataclasses
 import gc
 import math
 import os
+import traceback
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from functools import partial
+from pathlib import Path
+from typing import Any
 
 import torch
 import wandb
@@ -22,10 +25,11 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from slime.utils.memory_utils import clear_memory
+from slime.utils.routing_replay import RoutingReplay
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
-from .loss import loss_function
+from .loss import loss_function, get_debug_data_buffer, clear_debug_data_buffer
 from .model_provider import get_model_provider_func
 
 
@@ -333,7 +337,7 @@ def train_one_step(
     optimizer: MegatronOptimizer,
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
-) -> tuple[dict[str, float], float]:
+) -> tuple[dict[str, float], float, dict[str, Any] | None]:
     """Execute a single pipeline-parallel training step.
 
     Runs forward/backward over ``num_microbatches``, applies optimizer step and
@@ -350,8 +354,9 @@ def train_one_step(
         num_microbatches (int): Number of microbatches to process.
 
     Returns:
-        tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)
-        and gradient norm for logging.
+        tuple[dict[str, float], float, dict[str, Any] | None]: Reduced loss dictionary
+        (last stage only), gradient norm for logging, and optional debug data (only when
+        args.save_debug_train_output is set).
     """
     args = get_args()
 
@@ -399,6 +404,7 @@ def train_one_step(
                 "rollout_log_probs",
             ],
         )
+        # print("output_tensor", output_tensor.size())
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
@@ -467,6 +473,54 @@ def train_one_step(
         model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
 
+    # Collect debug data if requested
+    # IMPORTANT: Retrieve from global buffer, not from losses_reduced!
+    # losses_reduced accumulates data in GPU memory, causing OOM
+    debug_data_collected = None
+    if args.save_debug_train_output is not None and mpu.is_pipeline_last_stage(ignore_virtual=True):
+        # Retrieve debug data from global buffer (stored during forward pass)
+        debug_buffer = get_debug_data_buffer()
+        if debug_buffer:
+            # Aggregate debug data from all microbatches
+            debug_data_collected = {}
+            for mb_debug in debug_buffer:
+                for key, value in mb_debug.items():
+                    if key not in debug_data_collected:
+                        debug_data_collected[key] = []
+                    if isinstance(value, list):
+                        debug_data_collected[key].extend(value)
+                    else:
+                        debug_data_collected[key] = value
+            # Clear buffer to free memory
+            clear_debug_data_buffer()
+            
+            # Collect MoE routing data ONCE after all microbatches complete
+            # NOTE: This must be done AFTER all microbatches, not per-microbatch!
+            # Each RoutingReplay object accumulates routing across all microbatches in the step.
+            # Collecting per microbatch would cause massive duplication (O(N^2) memory).
+            if args.use_routing_replay:
+                try:
+                    routing_stage = os.environ.get("ROUTING_REPLAY_STAGE", "")
+                    if routing_stage in ["replay_forward", "replay_backward"]:
+                        print(f"Collecting MoE routing data ONCE for entire step (all {num_microbatches} microbatches)...")
+                        all_routing = []
+                        all_scores = []
+                        for replay_obj in RoutingReplay.all_routing_replays:
+                            routing = replay_obj.get_recorded_routing()
+                            scores = replay_obj.get_recorded_scores()
+                            # Transfer to CPU immediately to free GPU memory
+                            all_routing.append([r.detach().to("cpu", non_blocking=True) for r in routing])
+                            all_scores.append([s.detach().to("cpu", non_blocking=True) for s in scores])
+                        
+                        debug_data_collected["replay_routing_decisions"] = all_routing
+                        debug_data_collected["replay_routing_scores"] = all_scores
+                        debug_data_collected["routing_stage"] = routing_stage
+                        debug_data_collected["num_microbatches"] = num_microbatches
+                        print(f"Collected routing from {len(all_routing)} MoE layers × {num_microbatches} microbatches")
+                except Exception as e:
+                    print(f"Warning: Failed to collect routing data: {e}")
+                    traceback.print_exc()
+
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
         keys = losses_reduced[0]["keys"]
@@ -484,8 +538,8 @@ def train_one_step(
         num_samples_or_tokens = values[0]
         for key, value in zip(keys, values[1:]):
             loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
-        return loss_reduced, grad_norm
-    return {}, grad_norm
+        return loss_reduced, grad_norm, debug_data_collected
+    return {}, grad_norm, None
 
 
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
@@ -567,11 +621,14 @@ def train(
 
     num_steps_per_rollout = len(num_microbatches)
 
+    # Collect debug data from all steps if requested
+    all_steps_debug_data = [] if args.save_debug_train_output is not None else None
+
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
 
         # Run training step.
-        loss_dict, grad_norm = train_one_step(
+        loss_dict, grad_norm, step_debug_data = train_one_step(
             args,
             rollout_id,
             step_id,
@@ -581,6 +638,15 @@ def train(
             opt_param_scheduler,
             num_microbatches[step_id],
         )
+
+        # Collect debug data if available
+        if step_debug_data is not None and all_steps_debug_data is not None:
+            all_steps_debug_data.append({
+                "step_id": step_id,
+                "loss_dict": {k: v for k, v in loss_dict.items()},
+                "grad_norm": grad_norm,
+                "debug_data": step_debug_data,
+            })
 
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent
@@ -626,9 +692,77 @@ def train(
                     assert log_dict["train/kl_loss"] == 0.0, f"{log_dict=}"
 
             print(f"{role_tag}step {accumulated_step_id}: {log_dict}")
+    
+    # Save debug training output if requested
+    # Save on all DP ranks (since they process different data), but only on TP rank 0 
+    # (since TP ranks have the same results after all_reduce) and last PP stage 
+    # (only last stage has complete logits)
+    if (
+        args.save_debug_train_output is not None
+        and all_steps_debug_data is not None
+        and len(all_steps_debug_data) > 0
+        and mpu.get_tensor_model_parallel_rank() == 0
+        and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
+    ):
+        _save_debug_train_output(args, rollout_id, model, all_steps_debug_data)
+    
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
         disable_forward_pre_hook(model)
+
+
+def _save_debug_train_output(
+    args: Namespace, rollout_id: int, model: Sequence[DDP], all_steps_debug_data: list[dict]
+) -> None:
+    """Save detailed training output for debugging.
+
+    Args:
+        args (Namespace): Runtime arguments.
+        rollout_id (int): Rollout identifier.
+        model (Sequence[DDP]): Sequence of DDP-wrapped model chunks (for role info).
+        all_steps_debug_data (list[dict]): Collected debug data from all training steps.
+    """
+    rank = torch.distributed.get_rank()
+    role = getattr(model[0], "role", "actor")
+    
+    # Get parallel ranks
+    dp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    cp_rank = mpu.get_context_parallel_rank()
+    
+    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+    cp_size = mpu.get_context_parallel_world_size()
+    
+    path_template = args.save_debug_train_output
+    path = Path(path_template.format(rollout_id=rollout_id, rank=rank))
+    
+    print(f"[{role}] Saving debug train output to {path} (DP={dp_rank}/{dp_size}, TP={tp_rank}/{tp_size}, PP={pp_rank}/{pp_size}, CP={cp_rank}/{cp_size})")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Prepare data to save
+    save_data = {
+        "rollout_id": rollout_id,
+        "rank": rank,
+        "role": role,
+        "parallel_info": {
+            "dp_rank": dp_rank,
+            "tp_rank": tp_rank,
+            "pp_rank": pp_rank,
+            "cp_rank": cp_rank,
+            "dp_size": dp_size,
+            "tp_size": tp_size,
+            "pp_size": pp_size,
+            "cp_size": cp_size,
+        },
+        "num_steps": len(all_steps_debug_data),
+        "steps": all_steps_debug_data,
+    }
+    
+    torch.save(save_data, path)
+    print(f"[{role}] Successfully saved debug train output to {path}")
 
 
 def save(

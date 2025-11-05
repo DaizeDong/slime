@@ -49,3 +49,84 @@ Specifically, slime currently provides the following parameters for separate deb
 4.  `--load-debug-rollout-data /your/saved/debug/data_{rollout_id}.pt`
 
     When enabled, data will be loaded from `args.load_debug_rollout_data.format(rollout_id=rollout_id)`, and SGLang will not be initialized (automatically setting `debug_train_only=True`). This method allows you to fix the input for the training part to tune it, for example, by switching between different parallelization strategies.
+
+5.  `--save-debug-train-output /your/saved/debug/output_{rollout_id}_{rank}.pt`
+
+    When enabled, detailed training outputs will be saved for each training iteration to analyze the training process. The save path format is `args.save_debug_train_output.format(rollout_id=rollout_id, rank=rank)`.
+    
+    The saved data includes:
+    - `rollout_id`: Current rollout ID
+    - `rank`: Current process rank
+    - `role`: Model role (actor/critic)
+    - `num_steps`: Number of training steps
+    - `steps`: Detailed information for each training step, including:
+      - `step_id`: Step ID
+      - `loss_dict`: Loss dictionary (containing various loss metrics)
+      - `grad_norm`: Gradient norm
+      - `debug_data`: Detailed token-level data, including:
+        - `unconcat_tokens`: Token sequences for each sample
+        - `response_lengths`: Response length for each sample
+        - `total_lengths`: Total length for each sample
+        - `loss_masks`: Loss mask for each sample
+        - `advantages`: Advantage values (if available)
+        - `returns`: Return values (if available)
+        - `old_log_probs`: Old policy log probabilities (if available)
+        - `ref_log_probs`: Reference model log probabilities (if available)
+        - `values`: Value function outputs (if available)
+        - `current_log_probs`: Current policy log probabilities
+        - `current_entropy`: Current policy entropy (if available)
+        - **`policy_importance_ratio`**: **PPO/GRPO importance weights** $\frac{\pi_\theta}{\pi_{old}} = \exp(\log \pi_\theta - \log \pi_{old})$ (per token)
+        - `tis_importance_weights`: TIS importance weights (if TIS is enabled, used for trajectory importance sampling)
+        - `logits_sample`: Sample of logits (for inspection)
+    
+    **Saving Strategy**:
+    - **All DP ranks will save**: Because different DP ranks process different data batches, all data needs to be saved
+    - **Only TP rank 0 saves**: Because log_probs and other results are synchronized across TP ranks via all_reduce, all TP ranks have identical values
+    - **Only the last PP stage saves**: Because only the last pipeline stage has complete logits output
+    - The saved data includes a `parallel_info` field that records the DP/TP/PP/CP rank information for this file
+    
+    **TP Synchronization Note**: All `log_probs` and `entropy` values are already synchronized across TP ranks via all_reduce operations inside the `calculate_log_probs_and_entropy` function, ensuring that all TP ranks have consistent values.
+    
+    **Memory Optimization Note** (Critical!):
+    - All collected tensors use `.detach()` to **break the computation graph**, preventing gradient information from being retained
+    - Then use `.to("cpu", non_blocking=True)` for **asynchronous CPU transfer**, immediately freeing GPU memory
+    - **Most Critical**: debug_data is **NOT returned through Megatron's logging_dict**! Megatron accumulates all microbatches' logging_dict in GPU memory, causing OOM. We use a separate global buffer to avoid GPU accumulation
+
+6.  `--save-debug-train-output` **Additional Feature: Record vs Train Comparison**
+
+    When `--save-debug-train-output` is enabled along with `--use-routing-replay`, an additional record stage (first forward pass) data file is saved:
+    
+    **Saved Files**:
+    - `output_{rollout_id}_{rank}.pt` - Train stage data (second forward + backward pass)
+    - `output_{rollout_id}_{rank}_record.pt` - Record stage data (first forward pass for computing log_probs)
+    
+    **Record File Contains**:
+    - `log_probs`: Log probabilities computed from the first forward pass
+    - `routing_decisions`: MoE layer routing decisions (if routing_replay is enabled)
+    - `routing_scores`: MoE layer expert scores (if routing_replay is enabled) - **New**
+    - `response_lengths`, `total_lengths`: Sequence length information
+    - `parallel_info`: Parallel configuration information
+    
+    **Use Comparison Script to Verify Routing Replay**:
+    ```bash
+    python examples/debug_analysis/compare_record_train.py \
+        --rollout-id 0 \
+        --rank 0 \
+        --debug-dir /path/to/DEBUG/
+    ```
+    
+    The script will:
+    - ✅ Compare log_probs from both forward passes (should be identical)
+    - ✅ Compare MoE routing decisions (should be 100% consistent)
+    - ✅ Compare MoE expert scores numerical changes - **New**
+    - ✅ Analyze any inconsistencies and their extent
+    
+    **About routing_scores**:
+    - Scores record each token's affinity to all experts
+    - These scores are **currently used only for debugging/analysis**, not for replay forward
+    - May be used in future for advanced routing strategies (e.g., adaptive routing based on historical scores)
+    
+    **Why Two Forward Passes?**
+    - **First (record)**: Compute "old policy" log_probs, record MoE routing decisions, **no parameter updates**
+    - **Second (train)**: Actual training forward+backward pass, uses recorded routing decisions, **updates parameters**
+    - Although both use the same parameters, they serve completely different purposes: first is data collection, second is learning

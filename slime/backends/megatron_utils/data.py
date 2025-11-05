@@ -115,6 +115,9 @@ def gather_log_data(
         }
         print(f"{metric_name} {rollout_id}: {reduced_log_dict}")
 
+        first_data_full_info = {key: gathered_log_dict[0][key] for key in list(log_dict)[:1]}
+        print(f"{metric_name} {rollout_id} first rank data: {first_data_full_info}")
+
         # Calculate step once to avoid duplication
         step = (
             rollout_id
