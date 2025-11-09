@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tuned-off4-replay-union-2nodes-async
+#SBATCH --job-name=tuned-off4-replay-2nodes-async
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -105,7 +105,7 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 # training environment
-source "${SCRIPT_DIR}/models/qwen3-30B-A3B-union.sh"
+source "${SCRIPT_DIR}/models/qwen3-30B-A3B.sh"
 export WANDB_KEY="$(cat ${wandb_key_file})"
 export WANDB_GROUP=${model_name}-${run_postfix}
 
@@ -210,7 +210,7 @@ PERF_ARGS=(
   --recompute-method uniform
   --recompute-num-layers 1
   --use-dynamic-batch-size
-  --max-tokens-per-gpu 12288
+  --max-tokens-per-gpu 20480
 )
 
 GRPO_ARGS=(
@@ -246,7 +246,7 @@ WANDB_ARGS=(
 
 SGLANG_ARGS=(
   --rollout-num-gpus-per-engine 8
-  --sglang-mem-fraction-static 0.8
+  --sglang-mem-fraction-static 0.6
   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )
 
@@ -291,10 +291,6 @@ if [ "$THIS_NODE" = "$HEAD_NODE" ]; then
       --actor-num-nodes "${ACTOR_NUM_NODES}" \
       --actor-num-gpus-per-node "${ACTOR_GPUS_PER_NODE}" \
       --rollout-num-gpus "${ROLLOUT_NUM_GPUS}" \
-      --use-routing-replay \
-      --reverse-routing-replay-order \
-      --routing-replay-union \
-      --keep-old-actor \
       ${MODEL_ARGS[@]} \
       ${CKPT_ARGS[@]} \
       ${ROLLOUT_ARGS[@]} \

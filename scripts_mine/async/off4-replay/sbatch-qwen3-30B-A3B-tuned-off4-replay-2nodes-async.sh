@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tuned-off4-2nodes-async
+#SBATCH --job-name=tuned-off4-replay-replay-2nodes-async
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -291,6 +291,7 @@ if [ "$THIS_NODE" = "$HEAD_NODE" ]; then
       --actor-num-nodes "${ACTOR_NUM_NODES}" \
       --actor-num-gpus-per-node "${ACTOR_GPUS_PER_NODE}" \
       --rollout-num-gpus "${ROLLOUT_NUM_GPUS}" \
+      --use-routing-replay \
       ${MODEL_ARGS[@]} \
       ${CKPT_ARGS[@]} \
       ${ROLLOUT_ARGS[@]} \

@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=tuned-off4-replay-2nodes-async
-#SBATCH --nodes=2
+#SBATCH --job-name=on-replay-union
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gres=gpu:8
@@ -43,6 +43,14 @@ export RAY_PORT="${RAY_PORT:-6379}"
 export DASHBOARD_PORT="${DASHBOARD_PORT:-8265}"
 echo "[INFO] RAY_PORT=$RAY_PORT"
 echo "[INFO] DASHBOARD_PORT=$DASHBOARD_PORT"
+
+# Async training resource allocation
+export ACTOR_NUM_NODES=1
+export ACTOR_GPUS_PER_NODE=8
+export ROLLOUT_NUM_GPUS=$(( (SLURM_NNODES - ACTOR_NUM_NODES) * 8 ))
+export ROLLOUT_NUM_GPUS_PER_ENGINE=1
+
+echo "[INFO] Async resource split: actor=${ACTOR_NUM_NODES}x${ACTOR_GPUS_PER_NODE} GPUs, rollout=${ROLLOUT_NUM_GPUS} GPUs (per engine ${ROLLOUT_NUM_GPUS_PER_ENGINE})."
 
 ################################################################################
 #export SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -105,59 +113,10 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 # training environment
-source "${SCRIPT_DIR}/models/qwen3-30B-A3B.sh"
+source "${SCRIPT_DIR}/models/qwen3-30B-A3B-union.sh"
 export WANDB_KEY="$(cat ${wandb_key_file})"
-export WANDB_GROUP=${model_name}-${run_postfix}
-
-# Async training requires decoupled rollout resources.
-# Allow overriding via environment variables so the split can match the allocated GPUs.
-export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-1}"
-export ACTOR_GPUS_PER_NODE="${ACTOR_GPUS_PER_NODE:-8}"
-export ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-8}"
-export ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-8}"
-
-if ! [[ "$ROLLOUT_NUM_GPUS" =~ ^[0-9]+$ ]] || ! [[ "$ROLLOUT_NUM_GPUS_PER_ENGINE" =~ ^[0-9]+$ ]]; then
-  echo "[ERROR] ROLLOUT_NUM_GPUS (${ROLLOUT_NUM_GPUS}) and ROLLOUT_NUM_GPUS_PER_ENGINE (${ROLLOUT_NUM_GPUS_PER_ENGINE}) must be integers." >&2
-  exit 1
-fi
-
-if (( ROLLOUT_NUM_GPUS_PER_ENGINE <= 0 )); then
-  echo "[ERROR] ROLLOUT_NUM_GPUS_PER_ENGINE must be greater than 0." >&2
-  exit 1
-fi
-
-if (( ROLLOUT_NUM_GPUS < ROLLOUT_NUM_GPUS_PER_ENGINE )); then
-  echo "[ERROR] ROLLOUT_NUM_GPUS (${ROLLOUT_NUM_GPUS}) must be >= ROLLOUT_NUM_GPUS_PER_ENGINE (${ROLLOUT_NUM_GPUS_PER_ENGINE})." >&2
-  exit 1
-fi
-
-if (( ROLLOUT_NUM_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE != 0 )); then
-  echo "[ERROR] ROLLOUT_NUM_GPUS (${ROLLOUT_NUM_GPUS}) must be divisible by ROLLOUT_NUM_GPUS_PER_ENGINE (${ROLLOUT_NUM_GPUS_PER_ENGINE})." >&2
-  exit 1
-fi
-
-if ! [[ "$ACTOR_NUM_NODES" =~ ^[0-9]+$ ]] || (( ACTOR_NUM_NODES <= 0 )); then
-  echo "[ERROR] ACTOR_NUM_NODES (${ACTOR_NUM_NODES}) must be a positive integer." >&2
-  exit 1
-fi
-
-if ! [[ "$ACTOR_GPUS_PER_NODE" =~ ^[0-9]+$ ]] || (( ACTOR_GPUS_PER_NODE <= 0 )); then
-  echo "[ERROR] ACTOR_GPUS_PER_NODE (${ACTOR_GPUS_PER_NODE}) must be a positive integer." >&2
-  exit 1
-fi
-
-echo "[INFO] Async resource split: actor=${ACTOR_NUM_NODES}x${ACTOR_GPUS_PER_NODE} GPUs, rollout=${ROLLOUT_NUM_GPUS} GPUs (per engine ${ROLLOUT_NUM_GPUS_PER_ENGINE})."
-echo "[INFO] Ensure the Slurm allocation covers actor + rollout GPU pools (see docs/en/examples/qwen3-4B.md)."
-if command -v nvidia-smi >/dev/null 2>&1; then
-  local_gpu_count=$(nvidia-smi -L 2>/dev/null | wc -l | xargs)
-  if [[ "$local_gpu_count" =~ ^[0-9]+$ ]]; then
-    total_allocated_guess=$(( SLURM_NNODES * local_gpu_count ))
-    total_requested=$(( ACTOR_NUM_NODES * ACTOR_GPUS_PER_NODE + ROLLOUT_NUM_GPUS ))
-    if (( total_requested > total_allocated_guess )); then
-      echo "[WARN] Requested actor+rollout GPUs (${total_requested}) exceed naive capacity estimate (${total_allocated_guess}). Update ACTOR_* or ROLLOUT_* or request more GPUs." >&2
-    fi
-  fi
-fi
+export WANDB_PROJECT="slime-${model_name}"
+export WANDB_GROUP=${run_postfix}
 
 # model args
 CKPT_ARGS=(
@@ -165,7 +124,7 @@ CKPT_ARGS=(
   --ref-load ${dist_ckpt_path}
   --load ${megatron_ckpt_path}
   --save ${megatron_ckpt_path}
-  --save-interval 25
+  --save-interval 100
 )
 
 if [ -n "$start_rollout_id" ]; then
@@ -180,19 +139,21 @@ ROLLOUT_ARGS=(
   --rollout-shuffle
   --rm-type deepscaler
   --num-rollout 1000
-  --rollout-batch-size 128
+  --rollout-batch-size 32
   --n-samples-per-prompt 8
   --rollout-max-response-len 8192
   --rollout-temperature 0.8
-  --num-steps-per-rollout 4
+  --num-steps-per-rollout 1
   --global-batch-size 256
   --balance-data
   --seed 2333         # 🔎
   --rollout-seed 2333 # 🔎
+  --partial-rollout
+  --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
 )
 
 EVAL_ARGS=(
-  --eval-interval 25
+  --eval-interval 50
   --eval-prompt-data ${eval_prompt_data}
   --n-samples-per-eval-prompt 16
   --eval-max-response-len 16384
@@ -203,7 +164,7 @@ PERF_ARGS=(
   --tensor-model-parallel-size 4
   --sequence-parallel
   --pipeline-model-parallel-size 1
-  --context-parallel-size 2
+  --context-parallel-size 1
   --expert-model-parallel-size 8
   --expert-tensor-parallel-size 1
   --recompute-granularity full
@@ -238,7 +199,7 @@ OPTIMIZER_ARGS=(
 
 WANDB_ARGS=(
   --use-wandb
-  --wandb-project slime
+  --wandb-project ${WANDB_PROJECT}
   --wandb-group ${WANDB_GROUP}
   --wandb-key ${WANDB_KEY}
   --disable-wandb-random-suffix
@@ -246,7 +207,7 @@ WANDB_ARGS=(
 
 SGLANG_ARGS=(
   --rollout-num-gpus-per-engine 8
-  --sglang-mem-fraction-static 0.6
+  --sglang-mem-fraction-static 0.8
   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )
 
@@ -292,6 +253,9 @@ if [ "$THIS_NODE" = "$HEAD_NODE" ]; then
       --actor-num-gpus-per-node "${ACTOR_GPUS_PER_NODE}" \
       --rollout-num-gpus "${ROLLOUT_NUM_GPUS}" \
       --use-routing-replay \
+      --reverse-routing-replay-order \
+      --routing-replay-union \
+      --keep-old-actor \
       ${MODEL_ARGS[@]} \
       ${CKPT_ARGS[@]} \
       ${ROLLOUT_ARGS[@]} \

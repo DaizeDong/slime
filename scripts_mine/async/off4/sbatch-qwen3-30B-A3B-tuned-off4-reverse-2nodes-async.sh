@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tuned-2nodes-async
+#SBATCH --job-name=tuned-off4-replay-reverse-2nodes-async
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -165,7 +165,7 @@ CKPT_ARGS=(
   --ref-load ${dist_ckpt_path}
   --load ${megatron_ckpt_path}
   --save ${megatron_ckpt_path}
-  --save-interval 50
+  --save-interval 25
 )
 
 if [ -n "$start_rollout_id" ]; then
@@ -180,11 +180,11 @@ ROLLOUT_ARGS=(
   --rollout-shuffle
   --rm-type deepscaler
   --num-rollout 1000
-  --rollout-batch-size 32
+  --rollout-batch-size 128
   --n-samples-per-prompt 8
   --rollout-max-response-len 8192
   --rollout-temperature 0.8
-  --num-steps-per-rollout 1
+  --num-steps-per-rollout 4
   --global-batch-size 256
   --balance-data
   --seed 2333         # 🔎
@@ -192,7 +192,7 @@ ROLLOUT_ARGS=(
 )
 
 EVAL_ARGS=(
-  --eval-interval 50
+  --eval-interval 25
   --eval-prompt-data ${eval_prompt_data}
   --n-samples-per-eval-prompt 16
   --eval-max-response-len 16384
@@ -291,6 +291,8 @@ if [ "$THIS_NODE" = "$HEAD_NODE" ]; then
       --actor-num-nodes "${ACTOR_NUM_NODES}" \
       --actor-num-gpus-per-node "${ACTOR_GPUS_PER_NODE}" \
       --rollout-num-gpus "${ROLLOUT_NUM_GPUS}" \
+      --reverse-routing-replay-order \
+      --keep-old-actor \
       ${MODEL_ARGS[@]} \
       ${CKPT_ARGS[@]} \
       ${ROLLOUT_ARGS[@]} \
