@@ -4,7 +4,6 @@ import time
 import warnings
 from argparse import Namespace
 from contextlib import nullcontext
-from pathlib import Path
 from typing import Dict, Optional
 
 import ray
@@ -16,16 +15,19 @@ from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
 
 from slime.ray.train_actor import TrainRayActor
+from slime.utils import train_dump_utils
+from slime.utils.context_utils import with_defer
 from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.ray_utils import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.routing_replay import RoutingReplay
-from slime.utils.timer import Timer, timer
+from slime.utils.timer import Timer, inverse_timer, timer
 from slime.utils.types import RolloutBatch
 from slime.utils.wandb_utils import init_wandb_secondary
 
+from ...utils.profile_utils import TrainProfiler
 from .checkpoint import load_checkpoint
 from .cp_utils import slice_log_prob_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
@@ -36,6 +38,7 @@ from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTe
 
 
 class MegatronTrainRayActor(TrainRayActor):
+    @with_defer(lambda: Timer().start("train_wait"))
     def init(
         self,
         args: Namespace,
@@ -60,7 +63,6 @@ class MegatronTrainRayActor(TrainRayActor):
             dist.barrier(group=get_gloo_group())
 
         if self.args.debug_rollout_only:
-            Timer().start("train_wait")
             return 0
 
         if role == "critic":
@@ -76,7 +78,6 @@ class MegatronTrainRayActor(TrainRayActor):
         if role == "critic":
             if self.args.offload_train:
                 self.sleep()
-            Timer().start("train_wait")
             return
 
         start_rollout_id = loaded_rollout_id + 1
@@ -120,24 +121,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
             self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
 
-        self.prof = None
-        if args.use_pytorch_profiler and torch.distributed.get_rank() == 0:
-            self.prof = torch.profiler.profile(
-                schedule=torch.profiler.schedule(
-                    wait=max(args.profile_step_start - 1, 0),
-                    warmup=1 if args.profile_step_start > 0 else 0,
-                    active=args.profile_step_end - args.profile_step_start,
-                    repeat=1,
-                ),
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
-                record_shapes=True,
-                with_stack=True,
-                profile_memory=True,
-                with_flops=True,
-            )
-            self.prof.start()
+        self.prof = TrainProfiler(args)
 
-        Timer().start("train_wait")
         return start_rollout_id
 
     @torch.no_grad()
@@ -170,16 +155,6 @@ class MegatronTrainRayActor(TrainRayActor):
     @timer
     def wake_up(self) -> None:
         assert self.args.offload_train
-
-        # there are weird times when sglang is not offloaded immediately, so we wait here.
-        mem_fraction_static = self.args.sglang_mem_fraction_static or 0.8
-        for _ in range(60):
-            memory_info = print_memory("before wake_up model")
-            if memory_info["used_GB"] >= mem_fraction_static * memory_info["total_GB"]:
-                time.sleep(1)
-                continue
-            break
-
         torch_memory_saver.resume()
 
         clear_memory()
@@ -236,8 +211,6 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
-        Timer().end("train_wait")
-
         if self.args.offload_train:
             self.wake_up()
 
@@ -245,7 +218,6 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data = self._get_rollout_data(rollout_data_ref)
             if self.args.debug_rollout_only:
                 log_rollout_data(rollout_id, self.args, rollout_data)
-                Timer().start("train_wait")
                 return
 
         if self.role == "critic":
@@ -256,11 +228,11 @@ class MegatronTrainRayActor(TrainRayActor):
     @torch.no_grad()
     def _save_record_stage_data(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         """Save the record stage forward pass data for debugging and comparison.
-        
+
         This saves the first forward pass (record stage) outputs including:
         - log_probs computed from the actor model
         - MoE routing decisions (if routing_replay is enabled)
-        
+
         Args:
             rollout_id: Current rollout iteration
             rollout_data: Batch containing log_probs and other data
@@ -271,10 +243,10 @@ class MegatronTrainRayActor(TrainRayActor):
             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
         ):
             return
-        
+
         rank = torch.distributed.get_rank()
         dp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
-        
+
         record_stage_data = {
             "rollout_id": rollout_id,
             "rank": rank,
@@ -291,11 +263,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 "cp_size": mpu.get_context_parallel_world_size(),
             },
         }
-        
+
         # Save log_probs from the record stage
         if "log_probs" in rollout_data and rollout_data["log_probs"] is not None:
             record_stage_data["log_probs"] = [lp.cpu() for lp in rollout_data["log_probs"]]
-        
+
         # Save MoE routing decisions and scores if routing_replay is enabled
         if self.args.use_routing_replay:
             try:
@@ -307,26 +279,26 @@ class MegatronTrainRayActor(TrainRayActor):
                     scores = replay_obj.get_recorded_scores()
                     all_routing.append([r.cpu() for r in routing])
                     all_scores.append([s.cpu() for s in scores])
-                
+
                 record_stage_data["routing_decisions"] = all_routing
                 record_stage_data["routing_scores"] = all_scores
                 print(f"[Rank {rank}] Collected routing decisions and scores from {len(all_routing)} MoE layers")
             except Exception as e:
                 print(f"[Rank {rank}] Warning: Failed to collect routing decisions/scores: {e}")
-        
+
         # Save additional metadata
         if "response_lengths" in rollout_data:
             record_stage_data["response_lengths"] = rollout_data["response_lengths"]
         if "total_lengths" in rollout_data:
             record_stage_data["total_lengths"] = rollout_data["total_lengths"]
-        
+
         # Save to file
         path_template = self.args.save_debug_train_output
         path = Path(path_template.replace(
             "train_{rollout_id}_{rank}.pt",
             "train_{rollout_id}_{rank}_record.pt"
         ).format(rollout_id=rollout_id, rank=rank))
-        
+
         print(f"[Rank {rank}, DP {dp_rank}] Saving record stage data to {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(record_stage_data, path)
@@ -359,13 +331,12 @@ class MegatronTrainRayActor(TrainRayActor):
             data_iterator,
             num_microbatches,
         )
-        Timer().start("train_wait")
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
-        with timer("train"):
+        with inverse_timer("train_wait"), timer("train"):
             if self.args.compute_advantages_and_returns:
                 print(f"Data Before: {list(rollout_data.keys())} ")
 
@@ -402,15 +373,15 @@ class MegatronTrainRayActor(TrainRayActor):
 
                     if self.args.routing_replay_union:
                         # Use union of current and old actor routings for old_log_probs
-                        # 
+                        #
                         # Workflow:
-                        # 1. Record routing with current actor (π_θ) 
+                        # 1. Record routing with current actor (π_θ)
                         # 2. Compute union with old_actor (π_old) and update recorded routing
                         # 3. Training will use the union routing (see replay_backward below)
-                        # 
+                        #
                         # IMPORTANT: Union mode requires --moe-expert-capacity-factor to be set
                         # because it increases the number of experts per token dynamically.
-                        
+
                         # Step 1: Record routing with current actor (π_θ)
                         os.environ["ROUTING_REPLAY_STAGE"] = "record"
                         print(f"[RoutingReplay Step 1] Recording routing with current actor (π_θ)")
@@ -513,9 +484,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
             log_rollout_data(rollout_id, self.args, rollout_data)
 
-            if self.args.use_pytorch_profiler and torch.distributed.get_rank() == 0 and self.prof is not None:
-                self.prof.step()
-
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -539,30 +507,9 @@ class MegatronTrainRayActor(TrainRayActor):
                     num_microbatches,
                 )
 
-            # Profiling.
-            if (
-                self.args.use_pytorch_profiler
-                and rollout_id == self.args.profile_step_end
-                and torch.distributed.get_rank() == 0
-                and self.prof is not None
-            ):
-                self.prof.stop()
-                self.prof = None
+            self.prof.step()
 
-        # TODO extract to a function during refactor
-        if (path_template := self.args.save_debug_train_data) is not None:
-            rank = torch.distributed.get_rank()
-            path = Path(path_template.format(rollout_id=rollout_id, rank=rank))
-            print(f"Save debug train data to {path}")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                dict(
-                    rollout_id=rollout_id,
-                    rank=rank,
-                    rollout_data=rollout_data,
-                ),
-                path,
-            )
+        train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
 
         if self.args.use_routing_replay:
             RoutingReplay.clear_all()
@@ -582,7 +529,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.update_cpu_params_dict(self.weights["ref"])
 
         log_perf_data(rollout_id, self.args)
-        Timer().start("train_wait")
 
     def save_model(self, iteration: int) -> None:
         if self.args.debug_rollout_only:
