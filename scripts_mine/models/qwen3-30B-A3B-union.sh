@@ -14,41 +14,39 @@ printf -v MOE_LAYER_FREQ "[%s]" "$(IFS=', '; echo "${arr[*]}")"
 
 
 MODEL_ARGS=(
-   --spec "slime_plugins.models.qwen3_next" "get_qwen3_next_spec"
-
    --disable-bias-linear
    --qk-layernorm
    --group-query-attention
-   --num-attention-heads 16
-   --num-query-groups 2
-   --kv-channels 256
+   --num-attention-heads 32
+   --num-query-groups 4
+   --kv-channels 128
    --num-layers 48
    --hidden-size 2048
-   --ffn-hidden-size 5120
-   --use-gated-attention
+   --ffn-hidden-size 6144
 
    --normalization RMSNorm
-   --apply-layernorm-1p
    --position-embedding-type rope
    --norm-epsilon 1e-6
-   --rotary-percent 0.25
+   --rotary-percent 1.0
    --swiglu
    --untie-embeddings-and-output-weights
    --vocab-size 151936
 
-   --rotary-base 10000000
+   --rotary-base 1000000
 
    # moe
-   --moe-ffn-hidden-size 512
-   --moe-shared-expert-intermediate-size 512
+   --moe-ffn-hidden-size 768
    --moe-router-score-function softmax
    --moe-token-dispatcher-type alltoall
-   --moe-router-topk 10
+   --moe-router-topk 8
    --moe-layer-freq $MOE_LAYER_FREQ
-   --num-experts 512
+   --num-experts 128
    --moe-grouped-gemm
    --moe-token-drop-policy probs
    --moe-router-dtype fp32
    --moe-permute-fusion
    --moe-aux-loss-coeff 0
+   # Enable dynamic token count for routing replay union mode
+   # Capacity factor 2.0 accommodates union expansion (topk=8 can expand to ~12-16)
+   --moe-expert-capacity-factor 2.0
 )
