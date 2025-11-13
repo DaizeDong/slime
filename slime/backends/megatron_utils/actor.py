@@ -372,50 +372,80 @@ class MegatronTrainRayActor(TrainRayActor):
                     print("[RoutingReplay] Using REVERSED order: actor → old_actor")
 
                     if self.args.routing_replay_union:
-                        # Use union of current and old actor routings for old_log_probs
-                        #
-                        # Workflow:
-                        # 1. Record routing with current actor (π_θ)
-                        # 2. Compute union with old_actor (π_old) and update recorded routing
-                        # 3. Training will use the union routing (see replay_backward below)
-                        #
-                        # IMPORTANT: Union mode requires --moe-expert-capacity-factor to be set
-                        # because it increases the number of experts per token dynamically.
+                        if self.args.routing_replay_pre_union:
+                            # 🔎 Reverse + Union + Pre-union workflow
+                            # Step 1: Record routing with current actor (π_θ)
+                            os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                            print(f"[RoutingReplay Step 1] Recording routing with current actor (π_θ)")
+                            _ = self.compute_log_prob(
+                                "actor",
+                                data_iterator,
+                                num_microbatches,
+                                store_prefix="temp_",
+                            )
+                            for replay_obj in RoutingReplay.all_routing_replays:
+                                replay_obj.stash_preunion_records("current")
 
-                        # Step 1: Record routing with current actor (π_θ)
-                        os.environ["ROUTING_REPLAY_STAGE"] = "record"
-                        print(f"[RoutingReplay Step 1] Recording routing with current actor (π_θ)")
-
-                        # Forward pass to record routing (don't save log_probs from this pass)
-                        _ = self.compute_log_prob(
-                            "actor",
-                            data_iterator,
-                            num_microbatches,
-                            store_prefix="temp_",  # Use temp prefix, will not use these log_probs
-                        )
-
-                        # Step 2: Compute union with old_actor (π_old) and update recorded routing
-                        # The union stage will:
-                        # - Get recorded routing from Step 1
-                        # - Compute old_actor's routing
-                        # - Combine them into union
-                        # - Update the recorded routing with union results
-                        for replay_obj in RoutingReplay.all_routing_replays:
-                            replay_obj.reset_indices()
-
-                        os.environ["ROUTING_REPLAY_STAGE"] = "union"
-                        print(f"[RoutingReplay Step 2] Computing old_log_probs with old_actor (π_old) using UNION of recorded routings")
-
-                        rollout_data.update(
-                            self.compute_log_prob(
+                            # Step 2: Record routing with old_actor (π_old) without union interference
+                            os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                            print(f"[RoutingReplay Step 2] Recording routing with old_actor (π_old) prior to union")
+                            _ = self.compute_log_prob(
                                 "old_actor" if self.args.keep_old_actor else "actor",
                                 data_iterator,
                                 num_microbatches,
-                                store_prefix="",
+                                store_prefix="temp_",
                             )
-                        )
+                            for replay_obj in RoutingReplay.all_routing_replays:
+                                replay_obj.stash_preunion_records("old")
 
+                            # Step 3: Build the union offline so the following forwards can fully ignore gate outputs
+                            print(f"[RoutingReplay Step 3] Building UNION of recorded routings before forward replay")
+                            for replay_obj in RoutingReplay.all_routing_replays:
+                                replay_obj.build_preunion_union()
+                                replay_obj.reset_indices()
+
+                            # Step 4: Replay forward for old_log_probs with the pre-built union
+                            os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+                            print(f"[RoutingReplay Step 4] Computing old_log_probs with old_actor (π_old) using PRE-UNION routing")
+                            rollout_data.update(
+                                self.compute_log_prob(
+                                    "old_actor" if self.args.keep_old_actor else "actor",
+                                    data_iterator,
+                                    num_microbatches,
+                                    store_prefix="",
+                                )
+                            )
+                        else:
+                            # 🔎 Reverse + Union + Real-time-union workflow
+                            # Use union of current and old actor routings for old_log_probs (legacy inline-union workflow)
+                            os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                            print(f"[RoutingReplay Step 1] Recording routing with current actor (π_θ)")
+
+                            _ = self.compute_log_prob(
+                                "actor",
+                                data_iterator,
+                                num_microbatches,
+                                store_prefix="temp_",  # Use temp prefix, will not use these log_probs
+                            )
+
+                            for replay_obj in RoutingReplay.all_routing_replays:
+                                replay_obj.reset_indices()
+
+                            os.environ["ROUTING_REPLAY_STAGE"] = "union"
+                            print(
+                                f"[RoutingReplay Step 2] Computing old_log_probs with old_actor (π_old) using UNION of recorded routings"
+                            )
+
+                            rollout_data.update(
+                                self.compute_log_prob(
+                                    "old_actor" if self.args.keep_old_actor else "actor",
+                                    data_iterator,
+                                    num_microbatches,
+                                    store_prefix="",
+                                )
+                            )
                     else:
+                        # 🔎 Reverse workflow
                         # Use current actor's recorded routing for old_actor
                         # Step 1: Record routing with current actor (π_θ)
                         os.environ["ROUTING_REPLAY_STAGE"] = "record"
@@ -446,6 +476,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
 
                 else:
+                    # 🔎 Normal workflow
                     # Normal order: record routing with old_actor/actor
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "record"
@@ -492,7 +523,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 # If using reversed order, reset indices again for training pass
                 if self.args.reverse_routing_replay_order:
                     if self.args.routing_replay_union:
-                        print(f"[RoutingReplay Step 3] Training with current actor (π_θ) using UNION routing")
+                        if self.args.routing_replay_pre_union:
+                            print(f"[RoutingReplay Step 3] Training with current actor (π_θ) using PRE-UNION routing")
+                        else:
+                            print(f"[RoutingReplay Step 3] Training with current actor (π_θ) using UNION routing")
                     else:
                         print(f"[RoutingReplay Step 3] Training with current actor (π_θ) using recorded routing")
                     for replay_obj in RoutingReplay.all_routing_replays:

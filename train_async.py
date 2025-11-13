@@ -21,6 +21,10 @@ def train(args):
     # always update weight first so that sglang has the loaded weights from training.
     actor_model.update_weights()
 
+    if args.eval_interval is not None and args.eval_before_first_rollout:
+        initial_rollout_id = args.start_rollout_id if args.start_rollout_id is not None else 0
+        ray.get(rollout_manager.eval.remote(initial_rollout_id))
+
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):

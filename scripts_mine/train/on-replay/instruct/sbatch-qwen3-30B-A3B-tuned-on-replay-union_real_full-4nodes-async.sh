@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=on-replay-union_real
+#SBATCH --job-name=on-replay-union_real_full
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
@@ -100,6 +100,7 @@ pip install -e .
 cp -rf /root/out-Megatron-LM/megatron/core/dist_checkpointing/strategies/common.py /root/Megatron-LM/megatron/core/dist_checkpointing/strategies/common.py
 cp -rf /root/out-Megatron-LM/megatron/training/checkpointing.py /root/Megatron-LM/megatron/training/checkpointing.py
 cp -rf /root/out-Megatron-LM/megatron/core/transformer/moe/moe_utils.py /root/Megatron-LM/megatron/core/transformer/moe/moe_utils.py
+cp -rf /root/out-Megatron-LM/megatron/core/transformer/moe/router.py /root/Megatron-LM/megatron/core/transformer/moe/router.py
 #cp -rf /root/out-Megatron-LM/megatron/training/arguments.py /root/Megatron-LM/megatron/training/arguments.py
 #cp -rf /root/out-Megatron-LM/megatron/training/global_vars.py /root/Megatron-LM/megatron/training/global_vars.py
 
@@ -114,7 +115,7 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 # training environment
-source "${SCRIPT_DIR}/models/qwen3-30B-A3B-union.sh"
+source "${SCRIPT_DIR}/models/qwen3-30B-A3B-union-large-capacity.sh"
 export WANDB_KEY="$(cat ${wandb_key_file})"
 export WANDB_PROJECT="slime-${model_name}"
 export WANDB_GROUP=${run_postfix}

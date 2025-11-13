@@ -558,6 +558,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             reset_arg(parser, "--eval-interval", type=int, default=None)
 
             parser.add_argument(
+                "--eval-before-first-rollout",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help="Run evaluation once before training starts to capture a baseline metric.",
+            )
+
+            parser.add_argument(
                 "--eval-prompt-data",
                 type=str,
                 default=None,
@@ -783,7 +790,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help=(
                     "During replay, combine the recorded routing decisions with the current router's "
-                    "top-k candidates before selecting the final experts."
+                    "top-k candidates before selecting the final experts. Requires --reverse-routing-replay-order."
+                ),
+            )
+            parser.add_argument(
+                "--routing-replay-pre-union",
+                action="store_true",
+                default=False,
+                help=(
+                    "Split union routing into three phases (record current, record old, union) before "
+                    "running the old actor forward pass. Requires --routing-replay-union and "
+                    "--reverse-routing-replay-order."
                 ),
             )
             return parser
@@ -1449,6 +1466,18 @@ def slime_validate_args(args):
                 setattr(args, k, v)
             else:
                 print(f"Warning: Argument {k} is already set to {getattr(args, k)}, will not override with {v}.")
+
+    if args.reverse_routing_replay_order:
+        if not args.use_routing_replay:
+            raise ValueError("--reverse-routing-replay-order requires --use-routing-replay.")
+
+    if args.routing_replay_union:
+        if not args.reverse_routing_replay_order:
+            raise ValueError("--routing-replay-union requires --reverse-routing-replay-order.")
+
+    if args.routing_replay_pre_union:
+        if not args.routing_replay_union:
+            raise ValueError("--routing-replay-pre-union requires --routing-replay-union.")
 
 
 def hf_validate_args(args, hf_config):

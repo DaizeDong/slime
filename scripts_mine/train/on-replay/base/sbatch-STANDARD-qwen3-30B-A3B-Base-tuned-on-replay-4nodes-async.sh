@@ -100,6 +100,7 @@ pip install -e .
 cp -rf /root/out-Megatron-LM/megatron/core/dist_checkpointing/strategies/common.py /root/Megatron-LM/megatron/core/dist_checkpointing/strategies/common.py
 cp -rf /root/out-Megatron-LM/megatron/training/checkpointing.py /root/Megatron-LM/megatron/training/checkpointing.py
 cp -rf /root/out-Megatron-LM/megatron/core/transformer/moe/moe_utils.py /root/Megatron-LM/megatron/core/transformer/moe/moe_utils.py
+cp -rf /root/out-Megatron-LM/megatron/core/transformer/moe/router.py /root/Megatron-LM/megatron/core/transformer/moe/router.py
 #cp -rf /root/out-Megatron-LM/megatron/training/arguments.py /root/Megatron-LM/megatron/training/arguments.py
 #cp -rf /root/out-Megatron-LM/megatron/training/global_vars.py /root/Megatron-LM/megatron/training/global_vars.py
 
@@ -140,7 +141,7 @@ ROLLOUT_ARGS=(
   --rollout-shuffle
   --rm-type deepscaler
   --num-rollout 180
-  --rollout-batch-size 256
+#  --rollout-batch-size 256
   --over-sampling-batch-size 512
   --n-samples-per-prompt 8
   --rollout-max-response-len 30720
@@ -151,7 +152,7 @@ ROLLOUT_ARGS=(
   --seed 2333         # 🔎
   --rollout-seed 2333 # 🔎
   --partial-rollout
-  --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+#  --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
 )
 
 EVAL_ARGS=(
