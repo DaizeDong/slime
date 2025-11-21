@@ -21,7 +21,16 @@ log_file="${TIME}.${SLURMD_NODENAME}.${SLURM_JOB_ID}.${SLURM_PROCID}.log"
 err_file="${TIME}.${SLURMD_NODENAME}.${SLURM_JOB_ID}.${SLURM_PROCID}.err"
 
 exec 3>&1 4>&2
-trap 'exec 1>&3 2>&4 3>&- 4>&-' EXIT
+cleanup_offload_dir() {
+  if [[ -n "${offload_weights_dir-}" && -d "${offload_weights_dir}" ]]; then
+    rm -rf "${offload_weights_dir}"
+  fi
+}
+restore_fds() {
+  exec 1>&3 2>&4 3>&- 4>&-
+}
+trap 'cleanup_offload_dir; restore_fds' EXIT
+trap 'cleanup_offload_dir' INT TERM
 
 exec > >(tee -a "$LOGROOT/${log_file}" >&3)
 exec 2> >(tee -a "$LOGROOT/${err_file}" >&4)
@@ -64,6 +73,8 @@ export hf_ckpt_path="/mnt/sharefs/users/haolong.jia/checkpoint/${model_name}"
 export dist_ckpt_path="/mnt/sharefs/users/haolong.jia/checkpoint_torch_dist/${model_name}"
 export megatron_ckpt_path="/mnt/sharefs/users/haolong.jia/checkpoint_megatron/${model_name}-${run_postfix}"
 export start_rollout_id=$(val=$(cat "${megatron_ckpt_path}/latest_checkpointed_iteration.txt" 2>/dev/null || true); if [[ "$val" =~ ^[0-9]+$ ]]; then echo $((val+1)); else echo ""; fi)
+export offload_weights_dir="/mnt/weka/home/haolong.jia/workspace/rlhf/slime/offload/${SLURM_JOB_NAME}-${SLURM_JOB_ID}"
+mkdir -p "$offload_weights_dir"
 
 export prompt_data="/mnt/sharefs/users/haolong.jia/RL-data/dapo-math-17k/dapo-math-17k.jsonl"
 export eval_prompt_data="aime /mnt/sharefs/users/haolong.jia/RL-data/aime-2024/aime-2024.jsonl"
@@ -114,6 +125,8 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
+export RAY_memory_usage_threshold=0.99
+
 # training environment
 source "${SCRIPT_DIR}/models/qwen3-30B-A3B-union-large-capacity.sh"
 export WANDB_KEY="$(cat ${wandb_key_file})"
@@ -126,7 +139,7 @@ CKPT_ARGS=(
   --ref-load ${dist_ckpt_path}
   --load ${megatron_ckpt_path}
   --save ${megatron_ckpt_path}
-  --save-interval 100
+  --save-interval 50
 )
 
 if [ -n "$start_rollout_id" ]; then
@@ -142,6 +155,7 @@ ROLLOUT_ARGS=(
   --rm-type deepscaler
   --num-rollout 1000
   --rollout-batch-size 32
+  --over-sampling-batch-size 64
   --n-samples-per-prompt 8
   --rollout-max-response-len 8192
   --rollout-temperature 0.8
@@ -214,6 +228,12 @@ SGLANG_ARGS=(
   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )
 
+OFFLOAD_ARGS=(
+  --offload-weights-dir ${offload_weights_dir}
+  --offload-old-actor-to-disk
+  --offload-rollout-actor-to-disk
+)
+
 MISC_ARGS=(
   # default dropout in megatron is 0.1
   --attention-dropout 0.0
@@ -269,6 +289,7 @@ if [ "$THIS_NODE" = "$HEAD_NODE" ]; then
       ${PERF_ARGS[@]} \
       ${EVAL_ARGS[@]} \
       ${SGLANG_ARGS[@]} \
+      ${OFFLOAD_ARGS[@]} \
       ${MISC_ARGS[@]}
 
   echo "[HEAD] job finished, stopping ray..."

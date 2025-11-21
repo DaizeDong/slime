@@ -330,6 +330,25 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--offload-weights-dir",
+                type=str,
+                default="/tmp/slime_offload",
+                help="Directory for temporarily offloading CPU weight copies to disk.",
+            )
+            parser.add_argument(
+                "--offload-old-actor-to-disk",
+                action="store_true",
+                help="When keep-old-actor is enabled, store the old actor CPU weights on disk and load on demand.",
+            )
+            parser.add_argument(
+                "--offload-rollout-actor-to-disk",
+                action="store_true",
+                help=(
+                    "When keep-old-actor and update-weights-interval==1, store the rollout_actor CPU weights on disk "
+                    "and load on demand."
+                ),
+            )
+            parser.add_argument(
                 "--update-weights-interval",
                 type=int,
                 default=1,

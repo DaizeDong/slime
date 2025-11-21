@@ -4,6 +4,7 @@ import time
 import warnings
 from argparse import Namespace
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Dict, Optional
 
 import ray
@@ -82,6 +83,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         start_rollout_id = loaded_rollout_id + 1
         self.weights = {"actor": {}}
+        self._offloaded_paths: Dict[str, Path] = {}
         self.update_cpu_params_dict(self.weights["actor"])
 
         if with_ref:
@@ -94,6 +96,15 @@ class MegatronTrainRayActor(TrainRayActor):
             if args.update_weights_interval == 1:
                 self.weights["rollout_actor"] = {}
                 self.update_cpu_params_dict(self.weights["rollout_actor"])
+        # Offload CPU copies to disk if requested to save host RAM
+        if self.args.keep_old_actor and self.args.offload_old_actor_to_disk:
+            self._offload_weights_to_disk("old_actor")
+        if (
+            self.args.keep_old_actor
+            and self.args.update_weights_interval == 1
+            and self.args.offload_rollout_actor_to_disk
+        ):
+            self._offload_weights_to_disk("rollout_actor")
 
         update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
         self.weight_updater = update_weight_cls(
@@ -110,7 +121,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.offload_train:
             # recover to actor in the end.
-            self.update_gpu_params_dict(self.weights["actor"])
+            self.update_gpu_params_dict(self.weights["actor"], "actor")
             self.sleep()
 
         self.rollout_engines = None
@@ -126,19 +137,82 @@ class MegatronTrainRayActor(TrainRayActor):
         return start_rollout_id
 
     @torch.no_grad()
-    def update_cpu_params_dict(self, params_dict: Dict[str, torch.Tensor]) -> None:
+    def update_cpu_params_dict(self, params_dict: Optional[Dict[str, torch.Tensor]]) -> Optional[Dict[str, torch.Tensor]]:
+        if params_dict is None:
+            params_dict = {}
         for name, param in named_parameters(self.args, self.model):
             if name not in params_dict:
                 params_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
             params_dict[name].copy_(param.detach(), non_blocking=True)
         torch.cuda.synchronize()
+        return params_dict
 
     @torch.no_grad()
-    def update_gpu_params_dict(self, params_dict: Dict[str, torch.Tensor]) -> None:
+    def update_gpu_params_dict(self, params_dict: Optional[Dict[str, torch.Tensor]], tag: Optional[str] = None) -> None:
+        if params_dict is None:
+            if tag is not None and self._offload_enabled(tag):
+                self._load_weights_from_disk(tag)
+                params_dict = self.weights[tag]
+            else:
+                raise RuntimeError(f"Trying to load weights for {tag or 'unknown'} but nothing is cached.")
+
         for name, param in named_parameters(self.args, self.model):
-            assert name in params_dict
-            param.copy_(params_dict[name], non_blocking=True)
+            tensor = params_dict.get(name)
+            if tensor is None:
+                if tag is not None and self._offload_enabled(tag):
+                    self._load_weights_from_disk(tag)
+                    params_dict = self.weights[tag]
+                    tensor = params_dict.get(name)
+                if tensor is None:
+                    available = list(params_dict.keys())[:5]
+                    raise AssertionError(
+                        f"Parameter '{name}' missing in weights[{tag or 'unknown'}]; "
+                        f"available keys sample: {available}"
+                    )
+            param.copy_(tensor, non_blocking=True)
         torch.cuda.synchronize()
+
+    # --- Weight offload helpers -------------------------------------------------
+    def _get_offload_dir(self) -> Path:
+        return Path(self.args.offload_weights_dir) / f"rank{dist.get_rank()}"
+
+    def _offload_enabled(self, tag: str) -> bool:
+        return (tag == "old_actor" and self.args.offload_old_actor_to_disk) or (
+            tag == "rollout_actor" and self.args.offload_rollout_actor_to_disk
+        )
+
+    @torch.no_grad()
+    def _offload_weights_to_disk(self, tag: str) -> None:
+        if tag not in self.weights:
+            return
+        if self.weights[tag] is None:
+            # Already offloaded
+            return
+        if not self.weights[tag]:
+            # Nothing to offload yet
+            return
+        offload_dir = self._get_offload_dir()
+        offload_dir.mkdir(parents=True, exist_ok=True)
+        path = offload_dir / f"{tag}.pt"
+        torch.save(self.weights[tag], path)
+        self.weights[tag] = None
+        self._offloaded_paths[tag] = path
+
+    @torch.no_grad()
+    def _load_weights_from_disk(self, tag: str) -> None:
+        if self.weights.get(tag) is not None:
+            return
+        path = self._offloaded_paths.get(tag)
+        if path is None or not path.exists():
+            raise RuntimeError(f"Requested to load offloaded weights for {tag}, but file is missing at {path}")
+        data = torch.load(path, map_location="cpu")
+        if not isinstance(data, dict) or not data:
+            raise RuntimeError(f"Offloaded weights for {tag} at {path} are corrupt or empty.")
+        self.weights[tag] = data
+
+    def _ensure_weight_container(self, tag: str) -> None:
+        if self.weights.get(tag) is None:
+            self.weights[tag] = {}
 
     @timer
     def sleep(self) -> None:
@@ -198,10 +272,13 @@ class MegatronTrainRayActor(TrainRayActor):
         num_microbatches: list[int],
         store_prefix: str = "",
     ) -> Dict[str, list[torch.Tensor]]:
-        self.update_gpu_params_dict(self.weights[model_tag])
+        if self._offload_enabled(model_tag):
+            self._load_weights_from_disk(model_tag)
+
+        self.update_gpu_params_dict(self.weights[model_tag], model_tag)
 
         with timer(f"{store_prefix}log_probs"):
-            return forward_only(
+            result = forward_only(
                 get_log_probs_and_entropy,
                 self.args,
                 self.model,
@@ -209,6 +286,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 num_microbatches,
                 store_prefix=store_prefix,
             )
+
+        if self._offload_enabled(model_tag):
+            self._offload_weights_to_disk(model_tag)
+
+        return result
 
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
         if self.args.offload_train:
@@ -504,7 +586,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 # when there is old actor, we need to update the model params to actor manually
                 if "old_actor" in self.weights:
-                    self.update_gpu_params_dict(self.weights["actor"])
+                    self.update_gpu_params_dict(self.weights["actor"], "actor")
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
@@ -592,6 +674,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
             if getattr(self.args, "keep_old_actor", False):
                 if self.args.update_weights_interval == 1:
+                    if self._offload_enabled("old_actor"):
+                        self._load_weights_from_disk("old_actor")
+                    if self._offload_enabled("rollout_actor"):
+                        self._load_weights_from_disk("rollout_actor")
+                    self._ensure_weight_container("old_actor")
+                    self._ensure_weight_container("rollout_actor")
                     print("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
                     # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
                     # First copy rollout_actor to old_actor
@@ -599,8 +687,17 @@ class MegatronTrainRayActor(TrainRayActor):
                         self.weights["old_actor"][name].copy_(self.weights["rollout_actor"][name])
                     # Then copy current actor to rollout_actor
                     self.update_cpu_params_dict(self.weights["rollout_actor"])
+                    if self._offload_enabled("old_actor"):
+                        self._offload_weights_to_disk("old_actor")
+                    if self._offload_enabled("rollout_actor"):
+                        self._offload_weights_to_disk("rollout_actor")
                 else:
+                    if self._offload_enabled("old_actor"):
+                        self._load_weights_from_disk("old_actor")
+                    self._ensure_weight_container("old_actor")
                     self.update_cpu_params_dict(self.weights["old_actor"])
+                    if self._offload_enabled("old_actor"):
+                        self._offload_weights_to_disk("old_actor")
 
         if self.args.offload_train:
             destroy_process_groups()
@@ -630,6 +727,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.weights[model_tag] = {}
         self.update_cpu_params_dict(self.weights[model_tag])
+        if self._offload_enabled(model_tag):
+            self._offload_weights_to_disk(model_tag)
 
     def connect_actor_critic(
         self,
