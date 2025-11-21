@@ -120,10 +120,18 @@ class RoutingReplay:
         """
         return [score.clone() if score is not None else None for score in self.scores_list]
 
+    def clear_forward(self):
+        self.forward_index = 0
+
     @staticmethod
     def clear_all():
         for replay in RoutingReplay.all_routing_replays:
             replay.clear()
+
+    @staticmethod
+    def clear_all_forward():
+        for replay in RoutingReplay.all_routing_replays:
+            replay.clear_forward()
 
     @torch.no_grad()
     def stash_preunion_records(self, target: str) -> None:
@@ -393,7 +401,7 @@ def get_routing_replay_compute_topk(old_compute_topk, use_pre_softmax=False):
                 else:
                     assert (
                         top_indices.shape[0] == scores.shape[0] and top_indices.shape[1] == topk
-                    ), f"top_indices shape {top_indices.shape} does not match scores shape {scores.shape} and topk {topk}"
+                    ), f"[{torch.distributed.get_rank()}] top_indices shape {top_indices.shape} does not match scores shape {scores.shape} and topk {topk}"
                     probs = scores.gather(1, top_indices)
                 # Logging for debugging
                 if ROUTING_REPLAY.forward_index == 1 and selected_union_mask is not None:  # Only log once (after first forward)
@@ -422,7 +430,7 @@ def get_routing_replay_compute_topk(old_compute_topk, use_pre_softmax=False):
                 else:
                     assert (
                         top_indices.shape[0] == scores.shape[0] and top_indices.shape[1] == topk
-                    ), f"top_indices shape {top_indices.shape} does not match scores shape {scores.shape} and topk {topk}"
+                    ), f"[{torch.distributed.get_rank()}] top_indices shape {top_indices.shape} does not match scores shape {scores.shape} and topk {topk}"
                     probs = scores.gather(1, top_indices)
 
             else:

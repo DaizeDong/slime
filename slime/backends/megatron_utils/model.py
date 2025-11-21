@@ -1,5 +1,6 @@
 import dataclasses
 import gc
+import logging
 import math
 import os
 import traceback
@@ -10,10 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import wandb
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed import DistributedDataParallelConfig, finalize_model_grads
+from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -24,6 +24,7 @@ from megatron.core.utils import get_model_config
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
+from slime.utils import tracking_utils
 from slime.utils.memory_utils import clear_memory
 from slime.utils.routing_replay import RoutingReplay
 
@@ -32,6 +33,8 @@ from .cp_utils import slice_with_cp
 from .data import DataIterator, get_batch
 from .loss import loss_function, get_debug_data_buffer, clear_debug_data_buffer
 from .model_provider import get_model_provider_func
+
+logger = logging.getLogger(__name__)
 
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
@@ -109,44 +112,7 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
-    model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder, wrap_with_ddp=False)
-
-    config = get_model_config(model[0])
-
-    kwargs = {}
-    for f in dataclasses.fields(DistributedDataParallelConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
-    kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
-    kwargs["check_for_large_grads"] = args.check_for_large_grads
-    kwargs["bucket_size"] = args.ddp_bucket_size
-    kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
-    kwargs["average_in_collective"] = args.ddp_average_in_collective
-    ddp_config = DistributedDataParallelConfig(**kwargs)
-
-    # In the custom FSDP and DDP use path, we need to initialize the bucket size.
-    # If bucket_size is not provided as an input, use sane default.
-    # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
-    # ring-reduce implementations are large enough to remain bandwidth-bound rather than
-    # latency-bound.
-    if ddp_config.bucket_size is None:
-        ddp_config.bucket_size = max(40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True))
-    # Set bucket_size to infinity if overlap_grad_reduce is False.
-    if not ddp_config.overlap_grad_reduce:
-        ddp_config.bucket_size = None
-
-    model = [
-        DDP(
-            config=config,
-            ddp_config=ddp_config,
-            module=model_chunk,
-            # Turn off bucketing for model_chunk 2 onwards, since communication for these
-            # model chunks is overlapped with compute anyway.
-            disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
-        )
-        for (model_chunk_idx, model_chunk) in enumerate(model)
-    ]
+    model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
     # Optimizer
     kwargs = {}
@@ -536,7 +502,7 @@ def train_one_step(
                         debug_data_collected[key] = value
             # Clear buffer to free memory
             clear_debug_data_buffer()
-            
+
             # Collect MoE routing data ONCE after all microbatches complete
             # NOTE: This must be done AFTER all microbatches, not per-microbatch!
             # Each RoutingReplay object accumulates routing across all microbatches in the step.
@@ -554,7 +520,7 @@ def train_one_step(
                             # Transfer to CPU immediately to free GPU memory
                             all_routing.append([r.detach().to("cpu", non_blocking=True) for r in routing])
                             all_scores.append([s.detach().to("cpu", non_blocking=True) for s in scores])
-                        
+
                         debug_data_collected["replay_routing_decisions"] = all_routing
                         debug_data_collected["replay_routing_scores"] = all_scores
                         debug_data_collected["routing_stage"] = routing_stage
@@ -735,15 +701,8 @@ def train(
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
 
-            if args.use_wandb:
-                log_dict["train/step"] = accumulated_step_id
-                wandb.log(log_dict)
-
-            if args.use_tensorboard:
-                from slime.utils.tensorboard_utils import _TensorboardAdapter
-
-                tb = _TensorboardAdapter(args)
-                tb.log(data=log_dict, step=accumulated_step_id)
+            log_dict["train/step"] = accumulated_step_id
+            tracking_utils.log(args, log_dict, step_key="train/step")
 
             if args.ci_test and not args.ci_disable_kl_checker:
                 if step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
@@ -751,11 +710,11 @@ def train(
                 if accumulated_step_id == 0 and "train/kl_loss" in log_dict:
                     assert log_dict["train/kl_loss"] == 0.0, f"{log_dict=}"
 
-            print(f"{role_tag}step {accumulated_step_id}: {log_dict}")
-    
+            logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict}")
+
     # Save debug training output if requested
-    # Save on all DP ranks (since they process different data), but only on TP rank 0 
-    # (since TP ranks have the same results after all_reduce) and last PP stage 
+    # Save on all DP ranks (since they process different data), but only on TP rank 0
+    # (since TP ranks have the same results after all_reduce) and last PP stage
     # (only last stage has complete logits)
     if (
         args.save_debug_train_output is not None
@@ -765,7 +724,7 @@ def train(
         and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
     ):
         _save_debug_train_output(args, rollout_id, model, all_steps_debug_data)
-    
+
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
         disable_forward_pre_hook(model)
@@ -784,24 +743,24 @@ def _save_debug_train_output(
     """
     rank = torch.distributed.get_rank()
     role = getattr(model[0], "role", "actor")
-    
+
     # Get parallel ranks
     dp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
     tp_rank = mpu.get_tensor_model_parallel_rank()
     pp_rank = mpu.get_pipeline_model_parallel_rank()
     cp_rank = mpu.get_context_parallel_rank()
-    
+
     dp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
     tp_size = mpu.get_tensor_model_parallel_world_size()
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
-    
+
     path_template = args.save_debug_train_output
     path = Path(path_template.format(rollout_id=rollout_id, rank=rank))
-    
+
     print(f"[{role}] Saving debug train output to {path} (DP={dp_rank}/{dp_size}, TP={tp_rank}/{tp_size}, PP={pp_rank}/{pp_size}, CP={cp_rank}/{cp_size})")
     path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Prepare data to save
     save_data = {
         "rollout_id": rollout_id,
@@ -820,7 +779,7 @@ def _save_debug_train_output(
         "num_steps": len(all_steps_debug_data),
         "steps": all_steps_debug_data,
     }
-    
+
     torch.save(save_data, path)
     print(f"[{role}] Successfully saved debug train output to {path}")
 

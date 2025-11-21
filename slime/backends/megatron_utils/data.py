@@ -1,3 +1,4 @@
+import logging
 from argparse import Namespace
 from typing import Optional, Sequence, Union
 
@@ -5,18 +6,20 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import wandb
 from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from slime.utils import train_metric_utils
 from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
-from slime.utils.metric_utils import compute_pass_rate
+from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import RolloutBatch
 
+from ...utils import tracking_utils
 from .cp_utils import get_sum_of_sample_mean, slice_with_cp
+
+logger = logging.getLogger(__name__)
 
 
 def get_batch(
@@ -61,7 +64,8 @@ def get_batch(
 
     # Always pad to 128 to reduce memory fragmentation and maybe make the computation faster
     # TODO: make this configurable?
-    pad = (128 - tokens.size(0) % 128) % 128
+    pad_size = mpu.get_tensor_model_parallel_world_size() * 128
+    pad = (pad_size - tokens.size(0) % pad_size) % pad_size
     if pad != 0:
         tokens = F.pad(tokens, (0, pad), value=pad_token_id)
         cu_seqlens.append(cu_seqlens[-1] + pad)
@@ -113,26 +117,15 @@ def gather_log_data(
         reduced_log_dict = {
             f"{metric_name}/{key}": sum([d[key] for d in gathered_log_dict]) / dp_size for key in log_dict
         }
-        print(f"{metric_name} {rollout_id}: {reduced_log_dict}")
+        logger.info(f"{metric_name} {rollout_id}: {reduced_log_dict}")
 
         first_data_full_info = {key: gathered_log_dict[0][key] for key in list(log_dict)[:1]}
         print(f"{metric_name} {rollout_id} first rank data: {first_data_full_info}")
 
         # Calculate step once to avoid duplication
-        step = (
-            rollout_id
-            if not args.wandb_always_use_train_step
-            else rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
-        )
-        if args.use_wandb:
-            reduced_log_dict["rollout/step"] = step
-            wandb.log(reduced_log_dict)
-
-        if args.use_tensorboard:
-            from slime.utils.tensorboard_utils import _TensorboardAdapter
-
-            tb = _TensorboardAdapter(args)
-            tb.log(data=reduced_log_dict, step=step)
+        step = compute_rollout_step(args, rollout_id)
+        reduced_log_dict["rollout/step"] = step
+        tracking_utils.log(args, reduced_log_dict, step_key="rollout/step")
 
         return reduced_log_dict
     else:
@@ -318,7 +311,12 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
         total_lengths = rollout_data["total_lengths"]
 
         for key, val in rollout_data.items():
-            if key == "tokens" or key == "loss_masks" or key == "sample_indices":
+            if key in [
+                "tokens",
+                "loss_masks",
+                "sample_indices",
+                "rollout_routed_experts",
+            ]:
                 continue
             # Upload per sample mean for each rollout value
             # There are the following assumptions:
@@ -338,7 +336,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
             elif isinstance(val, torch.Tensor):
                 val = val.float().mean()
             else:
-                raise ValueError(f"Unsupported type: {type(val)}")
+                raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
 
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
@@ -449,7 +447,8 @@ def sync_actor_critic_data(
     - Log-probs and ref-log-probs are broadcast from src=0 when KL is used.
     Updates `rollout_data` in place with the synchronized tensors.
     """
-    values, log_probs, ref_log_probs = map(rollout_data.get, ("values", "log_probs", "ref_log_probs"))
+    log_probs_key = "log_probs" if not args.use_rollout_logprobs else "rollout_log_probs"
+    values, log_probs, ref_log_probs = map(rollout_data.get, ("values", log_probs_key, "ref_log_probs"))
 
     # return when not the pp last stage
     if not values and not log_probs:
@@ -473,4 +472,14 @@ def sync_actor_critic_data(
     for handle in handles:
         handle.wait()
 
-    rollout_data.update({"values": values, "log_probs": log_probs, "ref_log_probs": ref_log_probs})
+    rollout_data.update(
+        {
+            k: v
+            for k, v in {
+                "values": values,
+                log_probs_key: log_probs,
+                "ref_log_probs": ref_log_probs,
+            }.items()
+            if v is not None
+        }
+    )

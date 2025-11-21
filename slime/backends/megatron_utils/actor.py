@@ -1,3 +1,4 @@
+import logging
 import os
 import socket
 import time
@@ -10,6 +11,7 @@ from typing import Dict, Optional
 import ray
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from megatron.core import mpu
 from ray.actor import ActorHandle
 from torch_memory_saver import torch_memory_saver
@@ -25,17 +27,22 @@ from slime.utils.ray_utils import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.timer import Timer, inverse_timer, timer
+from slime.utils.tracking_utils import init_tracking
 from slime.utils.types import RolloutBatch
-from slime.utils.wandb_utils import init_wandb_secondary
 
 from ...utils.profile_utils import TrainProfiler
+from ...utils.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
-from .cp_utils import slice_log_prob_with_cp
+from .cp_utils import slice_log_prob_with_cp, slice_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor, named_parameters
+
+logging.getLogger("megatron").setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -44,17 +51,18 @@ class MegatronTrainRayActor(TrainRayActor):
         self,
         args: Namespace,
         role: str,
-        wandb_run_id: str,
         with_ref: bool = False,
     ) -> Optional[int]:
         monkey_patch_torch_dist()
 
-        super().init(args, role, wandb_run_id, with_ref)
+        super().init(args, role, with_ref)
 
         init(args)
 
         if is_megatron_main_rank():
-            init_wandb_secondary(args, wandb_run_id)
+            init_tracking(args, primary=False)
+
+        self.prof = TrainProfiler(args)
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(dist.get_world_size()):
@@ -82,9 +90,12 @@ class MegatronTrainRayActor(TrainRayActor):
             return
 
         start_rollout_id = loaded_rollout_id + 1
-        self.weights = {"actor": {}}
-        self._offloaded_paths: Dict[str, Path] = {}
-        self.update_cpu_params_dict(self.weights["actor"])
+
+        self.weights_backuper = TensorBackuper.create(
+            source_getter=lambda: named_parameters(self.args, self.model),
+            single_tag=None if args.enable_weights_backuper else "actor",
+        )
+        self.weights_backuper.backup("actor")
 
         if with_ref:
             self.load_other_checkpoint("ref", args.ref_load)
@@ -94,23 +105,13 @@ class MegatronTrainRayActor(TrainRayActor):
             self.load_other_checkpoint("old_actor", args.load)
             # Create rollout_actor as a copy of current actor
             if args.update_weights_interval == 1:
-                self.weights["rollout_actor"] = {}
-                self.update_cpu_params_dict(self.weights["rollout_actor"])
-        # Offload CPU copies to disk if requested to save host RAM
-        if self.args.keep_old_actor and self.args.offload_old_actor_to_disk:
-            self._offload_weights_to_disk("old_actor")
-        if (
-            self.args.keep_old_actor
-            and self.args.update_weights_interval == 1
-            and self.args.offload_rollout_actor_to_disk
-        ):
-            self._offload_weights_to_disk("rollout_actor")
+                self.weights_backuper.backup("rollout_actor")
 
         update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,
-            self.weights,
+            weights_getter=lambda: self.weights_backuper.get("actor"),
             model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
             quantization_config=getattr(self.hf_config, "quantization_config", None),
             vocab_size=self.tokenizer.vocab_size if self.args.vocab_size is None else self.args.vocab_size,
@@ -121,7 +122,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.offload_train:
             # recover to actor in the end.
-            self.update_gpu_params_dict(self.weights["actor"], "actor")
+            self.weights_backuper.restore("actor")
             self.sleep()
 
         self.rollout_engines = None
@@ -132,87 +133,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
             self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
 
-        self.prof = TrainProfiler(args)
+        self.prof.on_init_end()
 
         return start_rollout_id
-
-    @torch.no_grad()
-    def update_cpu_params_dict(self, params_dict: Optional[Dict[str, torch.Tensor]]) -> Optional[Dict[str, torch.Tensor]]:
-        if params_dict is None:
-            params_dict = {}
-        for name, param in named_parameters(self.args, self.model):
-            if name not in params_dict:
-                params_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
-            params_dict[name].copy_(param.detach(), non_blocking=True)
-        torch.cuda.synchronize()
-        return params_dict
-
-    @torch.no_grad()
-    def update_gpu_params_dict(self, params_dict: Optional[Dict[str, torch.Tensor]], tag: Optional[str] = None) -> None:
-        if params_dict is None:
-            if tag is not None and self._offload_enabled(tag):
-                self._load_weights_from_disk(tag)
-                params_dict = self.weights[tag]
-            else:
-                raise RuntimeError(f"Trying to load weights for {tag or 'unknown'} but nothing is cached.")
-
-        for name, param in named_parameters(self.args, self.model):
-            tensor = params_dict.get(name)
-            if tensor is None:
-                if tag is not None and self._offload_enabled(tag):
-                    self._load_weights_from_disk(tag)
-                    params_dict = self.weights[tag]
-                    tensor = params_dict.get(name)
-                if tensor is None:
-                    available = list(params_dict.keys())[:5]
-                    raise AssertionError(
-                        f"Parameter '{name}' missing in weights[{tag or 'unknown'}]; "
-                        f"available keys sample: {available}"
-                    )
-            param.copy_(tensor, non_blocking=True)
-        torch.cuda.synchronize()
-
-    # --- Weight offload helpers -------------------------------------------------
-    def _get_offload_dir(self) -> Path:
-        return Path(self.args.offload_weights_dir) / f"rank{dist.get_rank()}"
-
-    def _offload_enabled(self, tag: str) -> bool:
-        return (tag == "old_actor" and self.args.offload_old_actor_to_disk) or (
-            tag == "rollout_actor" and self.args.offload_rollout_actor_to_disk
-        )
-
-    @torch.no_grad()
-    def _offload_weights_to_disk(self, tag: str) -> None:
-        if tag not in self.weights:
-            return
-        if self.weights[tag] is None:
-            # Already offloaded
-            return
-        if not self.weights[tag]:
-            # Nothing to offload yet
-            return
-        offload_dir = self._get_offload_dir()
-        offload_dir.mkdir(parents=True, exist_ok=True)
-        path = offload_dir / f"{tag}.pt"
-        torch.save(self.weights[tag], path)
-        self.weights[tag] = None
-        self._offloaded_paths[tag] = path
-
-    @torch.no_grad()
-    def _load_weights_from_disk(self, tag: str) -> None:
-        if self.weights.get(tag) is not None:
-            return
-        path = self._offloaded_paths.get(tag)
-        if path is None or not path.exists():
-            raise RuntimeError(f"Requested to load offloaded weights for {tag}, but file is missing at {path}")
-        data = torch.load(path, map_location="cpu")
-        if not isinstance(data, dict) or not data:
-            raise RuntimeError(f"Offloaded weights for {tag} at {path} are corrupt or empty.")
-        self.weights[tag] = data
-
-    def _ensure_weight_container(self, tag: str) -> None:
-        if self.weights.get(tag) is None:
-            self.weights[tag] = {}
 
     @timer
     def sleep(self) -> None:
@@ -263,7 +186,74 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_data["rollout_log_probs"], rollout_data["total_lengths"], rollout_data["response_lengths"]
                 )
             ]
+        if "rollout_routed_experts" in rollout_data:
+            rollout_data["rollout_routed_experts"] = [
+                torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]
+            ]
         return rollout_data
+
+    def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
+        if "rollout_routed_experts" not in rollout_data:
+            raise ValueError(
+                "rollout_routed_experts is required in rollout_data when use_rollout_routing_replay is set."
+            )
+
+        from megatron.core.transformer.transformer_block import get_num_layers_to_build
+        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+        from slime.utils.routing_replay import RoutingReplay
+
+        for iterator in data_iterator:
+            iterator.reset()
+
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+
+        for _ in range(sum(num_microbatches)):
+            batch = data_iterator[0].get_next(["rollout_routed_experts", "tokens"])
+            rollout_routed_experts = batch["rollout_routed_experts"]
+            tokens = batch["tokens"]
+            assert len(rollout_routed_experts) == len(tokens)
+            for a, b in zip(rollout_routed_experts, tokens):
+                assert a.shape[0] == b.shape[0], f"{a.shape}, {b.shape}"
+
+            # TODO: maybe extract a common process function for here and get_batch?
+            rollout_routed_experts = [slice_with_cp(r, 0) for r in rollout_routed_experts]
+            rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
+            pad_size = mpu.get_tensor_model_parallel_world_size() * 128
+            pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
+            if pad != 0:
+                rollout_routed_experts = F.pad(rollout_routed_experts, (0, 0, 0, 0, 0, pad), value=0)
+
+            if self.args.sequence_parallel:
+                seqlen = rollout_routed_experts.size(0)
+                assert seqlen % tp_size == 0
+                start, end = seqlen // tp_size * tp_rank, seqlen // tp_size * (tp_rank + 1)
+                rollout_routed_experts = rollout_routed_experts[start:end]
+
+            routing_replay_offset = 0
+            for vp_stage, model in enumerate(self.model):
+                config = model.module.config
+                num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
+                offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+                for layer_id in range(offset, offset + num_layers_to_build):
+                    # skip dense layer
+                    if isinstance(config.moe_layer_freq, int):
+                        if layer_id % config.moe_layer_freq != 0:
+                            continue
+                    elif isinstance(config.moe_layer_freq, list):
+                        assert len(config.moe_layer_freq) == config.num_layers
+                        if config.moe_layer_freq[layer_id] == 0:
+                            continue
+                    layer_routed_experts = rollout_routed_experts[:, layer_id]
+                    RoutingReplay.all_routing_replays[routing_replay_offset].record(layer_routed_experts)
+                    routing_replay_offset += 1
+            assert routing_replay_offset == len(RoutingReplay.all_routing_replays)
+
+        del rollout_data["rollout_routed_experts"]
+
+        for iterator in data_iterator:
+            iterator.reset()
 
     def compute_log_prob(
         self,
@@ -272,13 +262,10 @@ class MegatronTrainRayActor(TrainRayActor):
         num_microbatches: list[int],
         store_prefix: str = "",
     ) -> Dict[str, list[torch.Tensor]]:
-        if self._offload_enabled(model_tag):
-            self._load_weights_from_disk(model_tag)
-
-        self.update_gpu_params_dict(self.weights[model_tag], model_tag)
+        self.weights_backuper.restore(model_tag)
 
         with timer(f"{store_prefix}log_probs"):
-            result = forward_only(
+            return forward_only(
                 get_log_probs_and_entropy,
                 self.args,
                 self.model,
@@ -286,11 +273,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 num_microbatches,
                 store_prefix=store_prefix,
             )
-
-        if self._offload_enabled(model_tag):
-            self._offload_weights_to_disk(model_tag)
-
-        return result
 
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
         if self.args.offload_train:
@@ -418,11 +400,14 @@ class MegatronTrainRayActor(TrainRayActor):
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
+        if self.args.use_rollout_routing_replay:
+            self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
+
         with inverse_timer("train_wait"), timer("train"):
             if self.args.compute_advantages_and_returns:
                 print(f"Data Before: {list(rollout_data.keys())} ")
 
-                if "ref" in self.weights:
+                if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     rollout_data.update(
@@ -434,120 +419,11 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
                     )
 
-                # Routing replay logic: choose between normal and reversed order
-                if self.args.use_routing_replay and self.args.reverse_routing_replay_order:
-                    # Reversed order: record routing with current actor (π_θ), then compute old_log_probs with old_actor
-                    if not self.args.keep_old_actor:
-                        warnings.warn(
-                            "\n"
-                            "╔═══════════════════════════════════════════════════════════════════╗\n"
-                            "║ WARNING: Using --reverse-routing-replay-order without             ║\n"
-                            "║ --keep-old-actor is MEANINGLESS!                                  ║\n"
-                            "║                                                                   ║\n"
-                            "║ Without old_actor, both forward passes use the SAME model,        ║\n"
-                            "║ resulting in identical outputs and wasting computation.           ║\n"
-                            "║                                                                   ║\n"
-                            "║ Recommendation: Add --keep-old-actor to make this feature work.   ║\n"
-                            "╚═══════════════════════════════════════════════════════════════════╝\n"
-                            "\n"
-                        )
-                    print("[RoutingReplay] Using REVERSED order: actor → old_actor")
-
-                    if self.args.routing_replay_union:
-                        if self.args.routing_replay_pre_union:
-                            # 🔎 Reverse + Union + Pre-union workflow
-                            # Step 1: Record routing with current actor (π_θ)
-                            os.environ["ROUTING_REPLAY_STAGE"] = "record"
-                            print(f"[RoutingReplay Step 1] Recording routing with current actor (π_θ)")
-                            _ = self.compute_log_prob(
-                                "actor",
-                                data_iterator,
-                                num_microbatches,
-                                store_prefix="temp_",
-                            )
-                            for replay_obj in RoutingReplay.all_routing_replays:
-                                replay_obj.stash_preunion_records("current")
-
-                            # Step 2: Record routing with old_actor (π_old) without union interference
-                            os.environ["ROUTING_REPLAY_STAGE"] = "record"
-                            print(f"[RoutingReplay Step 2] Recording routing with old_actor (π_old) prior to union")
-                            _ = self.compute_log_prob(
-                                "old_actor" if self.args.keep_old_actor else "actor",
-                                data_iterator,
-                                num_microbatches,
-                                store_prefix="temp_",
-                            )
-                            for replay_obj in RoutingReplay.all_routing_replays:
-                                replay_obj.stash_preunion_records("old")
-
-                            # Step 3: Build the union offline so the following forwards can fully ignore gate outputs
-                            print(f"[RoutingReplay Step 3] Building UNION of recorded routings before forward replay")
-                            for replay_obj in RoutingReplay.all_routing_replays:
-                                replay_obj.build_preunion_union()
-                                replay_obj.reset_indices()
-
-                            # Step 4: Replay forward for old_log_probs with the pre-built union
-                            os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
-                            print(f"[RoutingReplay Step 4] Computing old_log_probs with old_actor (π_old) using PRE-UNION routing")
-                            rollout_data.update(
-                                self.compute_log_prob(
-                                    "old_actor" if self.args.keep_old_actor else "actor",
-                                    data_iterator,
-                                    num_microbatches,
-                                    store_prefix="",
-                                )
-                            )
-                        else:
-                            # 🔎 Reverse + Union + Real-time-union workflow
-                            # Use union of current and old actor routings for old_log_probs (legacy inline-union workflow)
-                            os.environ["ROUTING_REPLAY_STAGE"] = "record"
-                            print(f"[RoutingReplay Step 1] Recording routing with current actor (π_θ)")
-
-                            _ = self.compute_log_prob(
-                                "actor",
-                                data_iterator,
-                                num_microbatches,
-                                store_prefix="temp_",  # Use temp prefix, will not use these log_probs
-                            )
-
-                            for replay_obj in RoutingReplay.all_routing_replays:
-                                replay_obj.reset_indices()
-
-                            os.environ["ROUTING_REPLAY_STAGE"] = "union"
-                            print(
-                                f"[RoutingReplay Step 2] Computing old_log_probs with old_actor (π_old) using UNION of recorded routings"
-                            )
-
-                            rollout_data.update(
-                                self.compute_log_prob(
-                                    "old_actor" if self.args.keep_old_actor else "actor",
-                                    data_iterator,
-                                    num_microbatches,
-                                    store_prefix="",
-                                )
-                            )
-                    else:
-                        # 🔎 Reverse workflow
-                        # Use current actor's recorded routing for old_actor
-                        # Step 1: Record routing with current actor (π_θ)
-                        os.environ["ROUTING_REPLAY_STAGE"] = "record"
-                        print(f"[RoutingReplay Step 1] Recording routing with current actor (π_θ)")
-
-                        # Forward pass to record routing (don't save log_probs from this pass)
-                        _ = self.compute_log_prob(
-                            "actor",
-                            data_iterator,
-                            num_microbatches,
-                            store_prefix="temp_",  # Use temp prefix, will not use these log_probs
-                        )
-
-                        # Step 2: Reset indices and compute old_log_probs with old_actor using recorded routing
-                        for replay_obj in RoutingReplay.all_routing_replays:
-                            replay_obj.reset_indices()
-
+                if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
+                    # Routing replay logic: choose between normal/reversed/union order
+                    if self.args.use_rollout_routing_replay:
+                        # Do not compute from old model
                         os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
-                        print(f"[RoutingReplay Step 2] Computing old_log_probs with old_actor (π_old) using recorded routing")
-
                         rollout_data.update(
                             self.compute_log_prob(
                                 "old_actor" if self.args.keep_old_actor else "actor",
@@ -557,19 +433,156 @@ class MegatronTrainRayActor(TrainRayActor):
                             )
                         )
 
-                else:
-                    # 🔎 Normal workflow
-                    # Normal order: record routing with old_actor/actor
-                    if self.args.use_routing_replay:
-                        os.environ["ROUTING_REPLAY_STAGE"] = "record"
-                    rollout_data.update(
-                        self.compute_log_prob(
-                            "old_actor" if self.args.keep_old_actor else "actor",
-                            data_iterator,
-                            num_microbatches,
-                            store_prefix="",
+                    elif self.args.use_routing_replay:
+                        if self.args.reverse_routing_replay_order:
+                            # Reversed order: record routing with current actor (π_θ), then compute old_log_probs with old_actor
+                            if not self.args.keep_old_actor:
+                                warnings.warn(
+                                    "\n"
+                                    "╔═══════════════════════════════════════════════════════════════════╗\n"
+                                    "║ WARNING: Using --reverse-routing-replay-order without             ║\n"
+                                    "║ --keep-old-actor is MEANINGLESS!                                  ║\n"
+                                    "║                                                                   ║\n"
+                                    "║ Without old_actor, both forward passes use the SAME model,        ║\n"
+                                    "║ resulting in identical outputs and wasting computation.           ║\n"
+                                    "║                                                                   ║\n"
+                                    "║ Recommendation: Add --keep-old-actor to make this feature work.   ║\n"
+                                    "╚═══════════════════════════════════════════════════════════════════╝\n"
+                                    "\n"
+                                )
+                            print("[RoutingReplay] Using REVERSED order: actor → old_actor")
+
+                            if self.args.routing_replay_union:
+                                # Union the old and new
+                                if self.args.routing_replay_pre_union:
+                                    # 🔎 Reverse + Union + Pre-union workflow
+                                    # Step 1: Record routing with current actor (π_θ)
+                                    os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                                    print(f"[RoutingReplay Step 1] Recording routing with current actor (π_θ)")
+                                    _ = self.compute_log_prob(
+                                        "actor",
+                                        data_iterator,
+                                        num_microbatches,
+                                        store_prefix="temp_",
+                                    )
+                                    for replay_obj in RoutingReplay.all_routing_replays:
+                                        replay_obj.stash_preunion_records("current")
+
+                                    # Step 2: Record routing with old_actor (π_old) without union interference
+                                    os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                                    print(f"[RoutingReplay Step 2] Recording routing with old_actor (π_old) prior to union")
+                                    _ = self.compute_log_prob(
+                                        "old_actor" if self.args.keep_old_actor else "actor",
+                                        data_iterator,
+                                        num_microbatches,
+                                        store_prefix="temp_",
+                                    )
+                                    for replay_obj in RoutingReplay.all_routing_replays:
+                                        replay_obj.stash_preunion_records("old")
+
+                                    # Step 3: Build the union offline so the following forwards can fully ignore gate outputs
+                                    print(f"[RoutingReplay Step 3] Building UNION of recorded routings before forward replay")
+                                    for replay_obj in RoutingReplay.all_routing_replays:
+                                        replay_obj.build_preunion_union()
+                                        replay_obj.reset_indices()
+
+                                    # Step 4: Replay forward for old_log_probs with the pre-built union
+                                    os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+                                    print(f"[RoutingReplay Step 4] Computing old_log_probs with old_actor (π_old) using PRE-UNION routing")
+                                    rollout_data.update(
+                                        self.compute_log_prob(
+                                            "old_actor" if self.args.keep_old_actor else "actor",
+                                            data_iterator,
+                                            num_microbatches,
+                                            store_prefix="",
+                                        )
+                                    )
+                                else:
+                                    # 🔎 Reverse + Union + Real-time-union workflow
+                                    # Use union of current and old actor routings for old_log_probs (legacy inline-union workflow)
+                                    os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                                    print(f"[RoutingReplay Step 1] Recording routing with current actor (π_θ)")
+
+                                    _ = self.compute_log_prob(
+                                        "actor",
+                                        data_iterator,
+                                        num_microbatches,
+                                        store_prefix="temp_",  # Use temp prefix, will not use these log_probs
+                                    )
+
+                                    for replay_obj in RoutingReplay.all_routing_replays:
+                                        replay_obj.reset_indices()
+
+                                    os.environ["ROUTING_REPLAY_STAGE"] = "union"
+                                    print(
+                                        f"[RoutingReplay Step 2] Computing old_log_probs with old_actor (π_old) using UNION of recorded routings"
+                                    )
+
+                                    rollout_data.update(
+                                        self.compute_log_prob(
+                                            "old_actor" if self.args.keep_old_actor else "actor",
+                                            data_iterator,
+                                            num_microbatches,
+                                            store_prefix="",
+                                        )
+                                    )
+                            else:
+                                # 🔎 Reverse workflow
+                                # Use current actor's recorded routing for old_actor
+                                # Step 1: Record routing with current actor (π_θ)
+                                os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                                print(f"[RoutingReplay Step 1] Recording routing with current actor (π_θ)")
+
+                                # Forward pass to record routing (don't save log_probs from this pass)
+                                _ = self.compute_log_prob(
+                                    "actor",
+                                    data_iterator,
+                                    num_microbatches,
+                                    store_prefix="temp_",  # Use temp prefix, will not use these log_probs
+                                )
+
+                                # Step 2: Reset indices and compute old_log_probs with old_actor using recorded routing
+                                for replay_obj in RoutingReplay.all_routing_replays:
+                                    replay_obj.reset_indices()
+
+                                os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+                                print(f"[RoutingReplay Step 2] Computing old_log_probs with old_actor (π_old) using recorded routing")
+
+                                rollout_data.update(
+                                    self.compute_log_prob(
+                                        "old_actor" if self.args.keep_old_actor else "actor",
+                                        data_iterator,
+                                        num_microbatches,
+                                        store_prefix="",
+                                    )
+                                )
+
+                        else:
+                            # 🔎 Normal workflow
+                            # Normal order: record routing with old_actor/actor
+                            os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                            rollout_data.update(
+                                self.compute_log_prob(
+                                    "old_actor" if self.args.keep_old_actor else "actor",
+                                    data_iterator,
+                                    num_microbatches,
+                                    store_prefix="",
+                                )
+                            )
+
+                    else:
+                        # 🔎 No Replay
+                        rollout_data.update(
+                            self.compute_log_prob(
+                                "old_actor" if self.args.keep_old_actor else "actor",
+                                data_iterator,
+                                num_microbatches,
+                                store_prefix="",
+                            )
                         )
-                    )
+
+                    if self.args.use_rollout_routing_replay:
+                        RoutingReplay.clear_all_forward()
 
                 print(f"Data After: {list(rollout_data.keys())} ")
 
@@ -585,8 +598,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
 
                 # when there is old actor, we need to update the model params to actor manually
-                if "old_actor" in self.weights:
-                    self.update_gpu_params_dict(self.weights["actor"], "actor")
+                if "old_actor" in self.weights_backuper.backup_tags:
+                    self.weights_backuper.restore("actor")
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
@@ -623,7 +636,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     num_microbatches,
                 )
 
-            self.prof.step()
+            self.prof.step(rollout_id=rollout_id)
 
         train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
 
@@ -631,18 +644,18 @@ class MegatronTrainRayActor(TrainRayActor):
             RoutingReplay.clear_all()
 
         # update the cpu actor weight to the latest model
-        self.update_cpu_params_dict(self.weights["actor"])
+        self.weights_backuper.backup("actor")
 
         # Update ref model if needed
         if (
             self.args.ref_update_interval is not None
             and (rollout_id + 1) % self.args.ref_update_interval == 0
-            and "ref" in self.weights
+            and "ref" in self.weights_backuper.backup_tags
         ):
             with timer("ref_model_update"):
                 if is_megatron_main_rank():
-                    print(f"Updating ref model at rollout_id {rollout_id}")
-                self.update_cpu_params_dict(self.weights["ref"])
+                    logger.info(f"Updating ref model at rollout_id {rollout_id}")
+                self.weights_backuper.backup("ref")
 
         log_perf_data(rollout_id, self.args)
 
@@ -674,30 +687,14 @@ class MegatronTrainRayActor(TrainRayActor):
 
             if getattr(self.args, "keep_old_actor", False):
                 if self.args.update_weights_interval == 1:
-                    if self._offload_enabled("old_actor"):
-                        self._load_weights_from_disk("old_actor")
-                    if self._offload_enabled("rollout_actor"):
-                        self._load_weights_from_disk("rollout_actor")
-                    self._ensure_weight_container("old_actor")
-                    self._ensure_weight_container("rollout_actor")
-                    print("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
+                    logger.info("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
                     # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
                     # First copy rollout_actor to old_actor
-                    for name in self.weights["old_actor"]:
-                        self.weights["old_actor"][name].copy_(self.weights["rollout_actor"][name])
+                    self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
                     # Then copy current actor to rollout_actor
-                    self.update_cpu_params_dict(self.weights["rollout_actor"])
-                    if self._offload_enabled("old_actor"):
-                        self._offload_weights_to_disk("old_actor")
-                    if self._offload_enabled("rollout_actor"):
-                        self._offload_weights_to_disk("rollout_actor")
+                    self.weights_backuper.backup("rollout_actor")
                 else:
-                    if self._offload_enabled("old_actor"):
-                        self._load_weights_from_disk("old_actor")
-                    self._ensure_weight_container("old_actor")
-                    self.update_cpu_params_dict(self.weights["old_actor"])
-                    if self._offload_enabled("old_actor"):
-                        self._offload_weights_to_disk("old_actor")
+                    self.weights_backuper.backup("old_actor")
 
         if self.args.offload_train:
             destroy_process_groups()
@@ -725,10 +722,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if model_tag == "ref" and self.args.ref_ckpt_step is not None:
             self.args.ckpt_step = old_ckpt_step
 
-        self.weights[model_tag] = {}
-        self.update_cpu_params_dict(self.weights[model_tag])
-        if self._offload_enabled(model_tag):
-            self._offload_weights_to_disk(model_tag)
+        self.weights_backuper.backup(model_tag)
 
     def connect_actor_critic(
         self,
