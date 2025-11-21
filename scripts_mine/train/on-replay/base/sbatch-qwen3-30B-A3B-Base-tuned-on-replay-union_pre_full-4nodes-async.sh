@@ -137,7 +137,7 @@ ROLLOUT_ARGS=(
   --prompt-data ${prompt_data}
   --input-key prompt
   --label-key label
-  --apply-chat-template
+#  --apply-chat-template
   --rollout-shuffle
   --rm-type deepscaler
   --num-rollout 200

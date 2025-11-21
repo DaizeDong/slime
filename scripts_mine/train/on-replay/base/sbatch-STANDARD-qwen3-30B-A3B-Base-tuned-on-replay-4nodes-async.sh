@@ -137,11 +137,11 @@ ROLLOUT_ARGS=(
   --prompt-data ${prompt_data}
   --input-key prompt
   --label-key label
-  --apply-chat-template
+#  --apply-chat-template
   --rollout-shuffle
   --rm-type deepscaler
   --num-rollout 180
-#  --rollout-batch-size 256
+  --rollout-batch-size 256
   --over-sampling-batch-size 512
   --n-samples-per-prompt 8
   --rollout-max-response-len 30720
@@ -273,7 +273,6 @@ if [ "$THIS_NODE" = "$HEAD_NODE" ]; then
   echo "[HEAD] job finished, stopping ray..."
 
 else
-
   echo "[WORKER $(hostname -s)] waiting for ${HEAD_NODE}:${RAY_PORT} ..."
   for i in $(seq 1 120); do
     (echo > /dev/tcp/"$HEAD_NODE"/"$RAY_PORT") >/dev/null 2>&1 && break
