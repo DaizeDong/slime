@@ -32,6 +32,7 @@ def get_base_gpu_id(args, rank):
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+    server_args.host = server_args.host.strip("[]")
     p = multiprocessing.Process(target=launch_server, args=(server_args,))
     p.start()
 
@@ -93,6 +94,17 @@ class SGLangEngine(RayActor):
         self.router_port = self.args.sglang_router_port
 
         host = host or get_host_info()[1]
+
+        # support ipv6 address
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+
+        # dist_init_addr may be 2605:...:10163, should split port
+        *addr_parts, port_str = dist_init_addr.split(":")
+        ipv6_addr = ":".join(addr_parts)
+        if ":" in ipv6_addr and not ipv6_addr.startswith("["):
+            dist_init_addr = f"[{ipv6_addr}]:{port_str}"
+
         server_args_dict, external_engine_need_check_fields = _compute_server_args(
             self.args, self.rank, dist_init_addr, nccl_port, host, port
         )
@@ -160,7 +172,11 @@ class SGLangEngine(RayActor):
 
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
         response = requests.post(url, json=payload or {})
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            e.add_note(f"{response.text=}")
+            raise
         return response.json()
 
     def health_generate(self, timeout: float = 5.0) -> bool:
@@ -265,6 +281,9 @@ class SGLangEngine(RayActor):
             "resume_memory_occupation",
             {"tags": tags},
         )
+
+    def check_weights(self, action: str):
+        return self._make_request("check_weights", {"action": action})
 
     def init_weights_update_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
         return self._make_request(
